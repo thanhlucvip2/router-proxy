@@ -1,6 +1,14 @@
 {
   "assignments": {
-    "10.42.0.104": 0
+    "10.42.0.104": 0,
+    "10.42.0.77": 0
+  },
+  "hotspot": {
+    "channel": 6,
+    "enabled": true,
+    "ifname": "wlp9s0",
+    "password": "12345678",
+    "ssid": "RouterWiFi"
   },
   "lan_cidr": "10.42.0.1/24",
   "proxies": [

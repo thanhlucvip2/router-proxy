@@ -27,6 +27,8 @@ STATE_FILE = STATE_DIR / "router_state.json"
 DNSMASQ_CONF = STATE_DIR / "dnsmasq.conf"
 DNSMASQ_LEASES = STATE_DIR / "dnsmasq.leases"
 DNSMASQ_PID = STATE_DIR / "dnsmasq.pid"
+HOSTAPD_CONF = STATE_DIR / "hostapd.conf"
+HOSTAPD_PID = STATE_DIR / "hostapd.pid"
 REDSOCKS_CONF = STATE_DIR / "redsocks.conf"
 REDSOCKS_PID = STATE_DIR / "redsocks.pid"
 DOMAIN_PROXY_PREFIX = "domain_proxy"
@@ -35,14 +37,30 @@ ADMIN_PASSWORD_FILE = STATE_DIR / "admin_password.txt"
 SESSION_FILE = STATE_DIR / "session_token.txt"
 
 DEFAULT_LAN_CIDR = "10.42.0.1/24"
+DEFAULT_BRIDGE_IF = "br-router"
+DEFAULT_WIFI_SSID = "RouterWiFi"
+DEFAULT_WIFI_CHANNEL = 6
 DEFAULT_ADMIN_USER = "admin"
 PROXY_CHAIN = "ROUTER_PROXY"
+GUARD_CHAIN = "ROUTER_GUARD"
 PROXY_LOCAL_BASE = 23450
 PROXY_TYPES = ("http", "https", "socks5", "socks4")
 PROXY_TEST_URLS = {
     "4": "https://api.ipify.org",
     "6": "https://api6.ipify.org",
 }
+BALANCE_FAMILIES = ("all", "4", "6")
+PRIVATE_NETS = (
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+)
 
 
 def sh(cmd, check=True, capture=True):
@@ -78,15 +96,75 @@ def delete_existing_rule(cmd):
 def require_commands(names):
     missing = [name for name in names if shutil.which(name) is None]
     if missing:
-        install = "sudo apt-get update && sudo apt-get install -y dnsmasq-base redsocks iptables conntrack"
+        install = "sudo apt-get update && sudo apt-get install -y dnsmasq-base redsocks iptables conntrack hostapd iw"
         raise RuntimeError(f"Thieu lenh: {', '.join(missing)}. Cai bang: {install}")
+
+
+def all_interface_names():
+    out = sh(["ip", "-j", "link"])
+    rows = json.loads(out)
+    return [row["ifname"] for row in rows if row["ifname"] != "lo"]
+
+
+def interface_exists(ifname):
+    return ifname in all_interface_names()
+
+
+def require_interface(ifname, role):
+    names = all_interface_names()
+    if ifname not in names:
+        shown = ", ".join(names) or "none"
+        raise RuntimeError(f"{role} interface {ifname!r} khong ton tai. Interfaces hien co: {shown}")
+
+
+def default_hotspot():
+    return {
+        "enabled": False,
+        "ifname": "",
+        "ssid": DEFAULT_WIFI_SSID,
+        "password": "",
+        "channel": DEFAULT_WIFI_CHANNEL,
+    }
+
+
+def default_state():
+    return {
+        "proxies": [],
+        "assignments": {},
+        "lan_cidr": DEFAULT_LAN_CIDR,
+        "hotspot": default_hotspot(),
+    }
+
+
+def normalized_hotspot(state):
+    raw = state.get("hotspot", {})
+    config = default_hotspot()
+    if isinstance(raw, dict):
+        for key in config:
+            if key in raw:
+                config[key] = raw[key]
+    config["enabled"] = bool(config.get("enabled"))
+    config["ifname"] = str(config.get("ifname", "")).strip()
+    config["ssid"] = str(config.get("ssid", "")).strip() or DEFAULT_WIFI_SSID
+    config["password"] = str(config.get("password", ""))
+    try:
+        channel = int(config.get("channel", DEFAULT_WIFI_CHANNEL))
+    except (TypeError, ValueError):
+        channel = DEFAULT_WIFI_CHANNEL
+    config["channel"] = channel if 1 <= channel <= 13 else DEFAULT_WIFI_CHANNEL
+    return config
 
 
 def load_state():
     STATE_DIR.mkdir(exist_ok=True)
     if not STATE_FILE.exists():
-        return {"proxies": [], "assignments": {}, "lan_cidr": DEFAULT_LAN_CIDR}
-    return json.loads(STATE_FILE.read_text())
+        return default_state()
+    state = json.loads(STATE_FILE.read_text())
+    state.setdefault("proxies", [])
+    state.setdefault("assignments", {})
+    state.setdefault("lan_cidr", DEFAULT_LAN_CIDR)
+    state["hotspot"] = normalized_hotspot(state)
+    return state
 
 
 def public_state(state):
@@ -94,6 +172,9 @@ def public_state(state):
     for proxy in data.get("proxies", []):
         if proxy.get("password"):
             proxy["password"] = "********"
+    hotspot = data.get("hotspot", {})
+    if hotspot.get("password"):
+        hotspot["password"] = "********"
     return data
 
 
@@ -133,6 +214,23 @@ def link_names():
     out = sh(["ip", "-j", "link"])
     rows = json.loads(out)
     return [row["ifname"] for row in rows if row["ifname"] != "lo" and not row["ifname"].startswith(("docker", "br-", "veth"))]
+
+
+def wireless_interfaces():
+    names = []
+    for name in link_names():
+        if Path(f"/sys/class/net/{name}/wireless").exists():
+            names.append(name)
+    if names or shutil.which("iw") is None:
+        return names
+    out = sh(["iw", "dev"], check=False)
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Interface "):
+            ifname = line.split(None, 1)[1].strip()
+            if ifname and ifname not in names:
+                names.append(ifname)
+    return names
 
 
 def detect_wan():
@@ -185,6 +283,38 @@ def dhcp_range_for(lan_cidr):
     return str(ipaddress.ip_address(start)), str(ipaddress.ip_address(end)), str(network.netmask)
 
 
+def current_mac(ifname):
+    try:
+        return Path(f"/sys/class/net/{ifname}/address").read_text().strip()
+    except OSError:
+        return ""
+
+
+def random_local_mac():
+    values = [secrets.randbits(8) for _ in range(6)]
+    values[0] = (values[0] | 0x02) & 0xFE
+    return ":".join(f"{value:02x}" for value in values)
+
+
+def renew_interface(ifname):
+    if shutil.which("networkctl"):
+        sudo(["networkctl", "renew", ifname], check=False)
+    if shutil.which("nmcli"):
+        sh(["nmcli", "device", "reapply", ifname], check=False)
+
+
+def rotate_interface_mac(ifname):
+    if not ifname or ifname == "lo":
+        raise ValueError("Interface khong hop le")
+    old_mac = current_mac(ifname)
+    new_mac = random_local_mac()
+    sudo(["ip", "link", "set", "dev", ifname, "down"])
+    sudo(["ip", "link", "set", "dev", ifname, "address", new_mac])
+    sudo(["ip", "link", "set", "dev", ifname, "up"])
+    renew_interface(ifname)
+    return old_mac, new_mac
+
+
 def pid_alive(pid_file):
     try:
         pid = int(Path(pid_file).read_text().strip())
@@ -210,6 +340,149 @@ def stop_pid(pid_file):
         if not pid_alive(pid_file):
             break
     Path(pid_file).unlink(missing_ok=True)
+
+
+def active_lan_if(base_lan_if, state=None):
+    hotspot = normalized_hotspot(state or load_state())
+    if hotspot["enabled"] and hotspot["ifname"]:
+        return DEFAULT_BRIDGE_IF
+    return base_lan_if
+
+
+def validate_hostapd_text(value, label):
+    if any(ch in value for ch in ("\n", "\r", "\0")):
+        raise ValueError(f"{label} khong duoc co ky tu xuong dong")
+    return value
+
+
+def parse_hotspot_form(data, existing_state, wan_if):
+    current = normalized_hotspot(existing_state)
+    ifname = data.get("ifname", "").strip()
+    if not ifname:
+        raise ValueError("Chua chon card WiFi")
+    require_interface(ifname, "WiFi")
+    if ifname == wan_if:
+        raise ValueError("Card WiFi hotspot khong duoc trung voi WAN")
+    wifi_names = wireless_interfaces()
+    if wifi_names and ifname not in wifi_names:
+        shown = ", ".join(wifi_names)
+        raise ValueError(f"{ifname!r} khong phai WiFi interface. WiFi hien co: {shown}")
+    ssid = validate_hostapd_text(data.get("ssid", "").strip(), "Ten WiFi")
+    if not ssid:
+        raise ValueError("Ten WiFi dang trong")
+    if len(ssid.encode("utf-8")) > 32:
+        raise ValueError("Ten WiFi toi da 32 byte")
+    password = data.get("password", "")
+    if not password and current.get("password"):
+        password = current["password"]
+    password = validate_hostapd_text(password, "Password WiFi")
+    if len(password) < 8 or len(password) > 63:
+        raise ValueError("Password WiFi phai tu 8 den 63 ky tu")
+    if any(ord(ch) < 32 or ord(ch) > 126 for ch in password):
+        raise ValueError("Password WiFi chi ho tro ASCII in duoc")
+    try:
+        channel = int(data.get("channel", current.get("channel", DEFAULT_WIFI_CHANNEL)))
+    except (TypeError, ValueError):
+        channel = DEFAULT_WIFI_CHANNEL
+    if channel < 1 or channel > 13:
+        raise ValueError("Kenh WiFi phai nam trong 1-13")
+    return {
+        "enabled": True,
+        "ifname": ifname,
+        "ssid": ssid,
+        "password": password,
+        "channel": channel,
+    }
+
+
+def write_hostapd_conf(config, bridge_if=""):
+    lines = [
+        f"interface={config['ifname']}",
+        "driver=nl80211",
+    ]
+    if bridge_if:
+        lines.append(f"bridge={bridge_if}")
+    lines.extend(
+        [
+            f"ssid={config['ssid']}",
+            "hw_mode=g",
+            f"channel={config['channel']}",
+            "ieee80211n=1",
+            "wmm_enabled=1",
+            "auth_algs=1",
+            "wpa=2",
+            f"wpa_passphrase={config['password']}",
+            "wpa_key_mgmt=WPA-PSK",
+            "rsn_pairwise=CCMP",
+            "",
+        ]
+    )
+    HOSTAPD_CONF.write_text(
+        "\n".join(lines)
+    )
+    HOSTAPD_CONF.chmod(0o600)
+
+
+def stop_hostapd_processes():
+    proc_rows = sh(["ps", "-eo", "pid,args"], check=False)
+    conf_path = str(HOSTAPD_CONF)
+    for line in proc_rows.splitlines():
+        line = line.strip()
+        if not line or "hostapd" not in line or conf_path not in line:
+            continue
+        pid_text, _, _ = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            sudo(["kill", f"-{sig.name.removeprefix('SIG')}", str(pid)], check=False)
+            for _ in range(10):
+                time.sleep(0.1)
+                if not sudo_success(["kill", "-0", str(pid)]):
+                    break
+            if not sudo_success(["kill", "-0", str(pid)]):
+                break
+    HOSTAPD_PID.unlink(missing_ok=True)
+
+
+def stop_hotspot(config=None):
+    if config is None:
+        config = normalized_hotspot(load_state())
+    elif isinstance(config, dict) and "hotspot" in config:
+        config = normalized_hotspot(config)
+    else:
+        config = normalized_hotspot({"hotspot": config})
+    stop_pid(HOSTAPD_PID)
+    stop_hostapd_processes()
+    if config.get("ifname") and shutil.which("nmcli"):
+        sudo(["nmcli", "device", "set", config["ifname"], "managed", "yes"], check=False)
+    if config.get("ifname"):
+        sudo(["ip", "link", "set", "dev", config["ifname"], "nomaster"], check=False)
+
+
+def start_hotspot(config, bridge_if=""):
+    config = normalized_hotspot({"hotspot": config})
+    if not config["enabled"]:
+        stop_hotspot(config)
+        return
+    require_commands(["hostapd", "ip"])
+    require_interface(config["ifname"], "WiFi")
+    stop_hotspot(config)
+    write_hostapd_conf(config, bridge_if)
+    sudo(["systemctl", "stop", "hostapd"], check=False)
+    if shutil.which("rfkill"):
+        sudo(["rfkill", "unblock", "wifi"], check=False)
+    if shutil.which("nmcli"):
+        sudo(["nmcli", "device", "disconnect", config["ifname"]], check=False)
+        sudo(["nmcli", "device", "set", config["ifname"], "managed", "no"], check=False)
+    sudo(["ip", "link", "set", config["ifname"], "up"], check=False)
+    sudo(["hostapd", "-B", "-P", str(HOSTAPD_PID), str(HOSTAPD_CONF)])
+    for _ in range(15):
+        time.sleep(0.2)
+        if pid_alive(HOSTAPD_PID):
+            return
+    raise RuntimeError("hostapd khong khoi dong duoc")
 
 
 def stop_redsocks_processes():
@@ -375,6 +648,8 @@ def start_dnsmasq(lan_if, lan_cidr):
 
 def ensure_router(wan_if, lan_if, lan_cidr):
     require_commands(["ip", "iptables", "sysctl", "dnsmasq"])
+    require_interface(wan_if, "WAN")
+    require_interface(lan_if, "LAN")
     lan_ip, _, _ = cidr_parts(lan_cidr)
     sudo(["ip", "link", "set", lan_if, "up"])
     sudo(["ip", "addr", "flush", "dev", lan_if])
@@ -395,12 +670,10 @@ def ensure_router(wan_if, lan_if, lan_cidr):
     return lan_ip
 
 
-def stop_router(wan_if, lan_if):
+def remove_router_rules(wan_if, lan_if):
+    if not lan_if:
+        return
     iptables_proxy_reset(lan_if)
-    stop_pid(REDSOCKS_PID)
-    stop_redsocks_processes()
-    stop_domain_proxy_workers()
-    stop_pid(DNSMASQ_PID)
     delete_existing_rule(["iptables", "-t", "nat", "-D", "POSTROUTING", "-o", wan_if, "-j", "MASQUERADE"])
     for rule in (
         ["FORWARD", "-i", lan_if, "-o", wan_if, "-j", "ACCEPT"],
@@ -409,8 +682,159 @@ def stop_router(wan_if, lan_if):
         delete_existing_rule(["iptables", "-D", *rule])
 
 
-def list_leases(lan_if, lan_cidr):
+def clear_lan_addresses(ifname, lan_cidr):
+    if not ifname:
+        return
     lan_net = ipaddress.ip_interface(lan_cidr).network
+    rows = json.loads(sh(["ip", "-j", "addr", "show", "dev", ifname], check=False) or "[]")
+    for row in rows:
+        for info in row.get("addr_info", []):
+            if info.get("family") != "inet":
+                continue
+            local = info.get("local", "")
+            prefixlen = info.get("prefixlen")
+            try:
+                if not local or ipaddress.ip_address(local) not in lan_net:
+                    continue
+            except ValueError:
+                continue
+            sudo(["ip", "addr", "del", f"{local}/{prefixlen}", "dev", ifname], check=False)
+
+
+def ensure_lan_bridge(base_lan_if, wifi_if, bridge_if, lan_cidr):
+    require_commands(["ip"])
+    require_interface(base_lan_if, "LAN")
+    require_interface(wifi_if, "WiFi")
+    if not interface_exists(bridge_if):
+        sudo(["ip", "link", "add", "name", bridge_if, "type", "bridge"])
+        sudo(["ip", "link", "set", "dev", bridge_if, "type", "bridge", "stp_state", "0"], check=False)
+    clear_lan_addresses(base_lan_if, lan_cidr)
+    clear_lan_addresses(wifi_if, lan_cidr)
+    sudo(["ip", "link", "set", "dev", base_lan_if, "nomaster"], check=False)
+    sudo(["ip", "link", "set", "dev", base_lan_if, "master", bridge_if])
+    sudo(["ip", "link", "set", "dev", base_lan_if, "up"])
+    sudo(["ip", "link", "set", "dev", bridge_if, "up"])
+
+
+def teardown_lan_bridge(base_lan_if, bridge_if):
+    if base_lan_if and interface_exists(base_lan_if):
+        sudo(["ip", "link", "set", "dev", base_lan_if, "nomaster"], check=False)
+    if interface_exists(bridge_if):
+        sudo(["ip", "link", "set", "dev", bridge_if, "down"], check=False)
+        sudo(["ip", "link", "del", "dev", bridge_if], check=False)
+
+
+def apply_router_stack(wan_if, base_lan_if, lan_cidr):
+    state = load_state()
+    hotspot = normalized_hotspot(state)
+    lan_if = active_lan_if(base_lan_if, state)
+    stale_lan_ifs = [base_lan_if]
+    if hotspot["ifname"]:
+        stale_lan_ifs.append(hotspot["ifname"])
+    if lan_if == DEFAULT_BRIDGE_IF:
+        ensure_lan_bridge(base_lan_if, hotspot["ifname"], lan_if, lan_cidr)
+    else:
+        stop_hotspot(hotspot)
+        teardown_lan_bridge(base_lan_if, DEFAULT_BRIDGE_IF)
+    for stale_if in dict.fromkeys(stale_lan_ifs):
+        if stale_if and stale_if != lan_if:
+            remove_router_rules(wan_if, stale_if)
+    ensure_router(wan_if, lan_if, lan_cidr)
+    if hotspot["enabled"]:
+        start_hotspot(hotspot, lan_if if lan_if == DEFAULT_BRIDGE_IF else "")
+    else:
+        stop_hotspot(hotspot)
+    apply_proxy_rules(lan_if)
+    return lan_if
+
+
+def stop_router(wan_if, lan_if):
+    stop_hotspot()
+    remove_router_rules(wan_if, lan_if)
+    stop_pid(REDSOCKS_PID)
+    stop_redsocks_processes()
+    stop_domain_proxy_workers()
+    stop_pid(DNSMASQ_PID)
+    if lan_if == DEFAULT_BRIDGE_IF:
+        teardown_lan_bridge("", DEFAULT_BRIDGE_IF)
+
+
+def normalize_mac(mac):
+    return str(mac or "").strip().lower()
+
+
+def wifi_station_details(wifi_if):
+    stations = {}
+    if not wifi_if or shutil.which("iw") is None:
+        return stations
+    out = sh(["iw", "dev", wifi_if, "station", "dump"], check=False)
+    current = None
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Station "):
+            parts = line.split()
+            current = normalize_mac(parts[1] if len(parts) > 1 else "")
+            if current:
+                stations[current] = {"mac": current, "interface": wifi_if}
+            continue
+        if not current or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().replace(" ", "_")
+        stations[current][key] = value.strip()
+    return stations
+
+
+def bridge_fdb_ports(bridge_if):
+    ports = {}
+    if not bridge_if or shutil.which("bridge") is None or not interface_exists(bridge_if):
+        return ports
+    out = sh(["bridge", "-j", "fdb", "show", "br", bridge_if], check=False)
+    try:
+        rows = json.loads(out or "[]")
+    except json.JSONDecodeError:
+        rows = []
+    for row in rows:
+        mac = normalize_mac(row.get("mac", ""))
+        if not mac or mac.startswith(("01:", "33:33:")):
+            continue
+        flags = set(row.get("flags", []))
+        if "self" in flags or row.get("state") == "permanent":
+            continue
+        if row.get("ifname"):
+            ports[mac] = row["ifname"]
+    return ports
+
+
+def classify_client(mac, lan_if, base_lan_if, wifi_if, wifi_stations=None, fdb_ports=None):
+    mac = normalize_mac(mac)
+    wifi_stations = wifi_stations or {}
+    fdb_ports = fdb_ports or {}
+    if mac and mac in wifi_stations:
+        station = wifi_stations[mac]
+        detail = station.get("signal", "")
+        return {"connection": "WiFi", "interface": wifi_if, "detail": detail}
+    port = fdb_ports.get(mac, "")
+    if port == wifi_if:
+        return {"connection": "WiFi", "interface": wifi_if, "detail": ""}
+    if port == base_lan_if:
+        return {"connection": "LAN", "interface": base_lan_if, "detail": ""}
+    if lan_if == wifi_if:
+        return {"connection": "WiFi", "interface": wifi_if, "detail": ""}
+    if lan_if == base_lan_if:
+        return {"connection": "LAN", "interface": base_lan_if, "detail": ""}
+    return {"connection": "Unknown", "interface": port or lan_if, "detail": ""}
+
+
+def annotate_client(row, lan_if, base_lan_if, wifi_if, wifi_stations, fdb_ports):
+    row.update(classify_client(row.get("mac", ""), lan_if, base_lan_if, wifi_if, wifi_stations, fdb_ports))
+    return row
+
+
+def list_leases(lan_if, lan_cidr, base_lan_if="", wifi_if=""):
+    lan_net = ipaddress.ip_interface(lan_cidr).network
+    wifi_stations = wifi_station_details(wifi_if)
+    fdb_ports = bridge_fdb_ports(lan_if if lan_if == DEFAULT_BRIDGE_IF else "")
     leases = {}
     if DNSMASQ_LEASES.exists():
         for line in DNSMASQ_LEASES.read_text().splitlines():
@@ -442,7 +866,61 @@ def list_leases(lan_if, lan_cidr):
             leases[ip] = {"ip": ip, "mac": lladdr, "hostname": "", "expires": "", "source": "arp"}
         elif lladdr and not leases[ip].get("mac"):
             leases[ip]["mac"] = lladdr
-    return sorted(leases.values(), key=lambda x: tuple(int(p) for p in x["ip"].split(".")))
+    rows = [
+        annotate_client(row, lan_if, base_lan_if, wifi_if, wifi_stations, fdb_ports)
+        for row in leases.values()
+    ]
+    return sorted(rows, key=lambda x: tuple(int(p) for p in x["ip"].split(".")))
+
+
+def interface_kind(ifname):
+    if Path(f"/sys/class/net/{ifname}/bridge").exists():
+        return "bridge"
+    if Path(f"/sys/class/net/{ifname}/wireless").exists():
+        return "wifi"
+    if ifname.startswith(("docker", "br-", "veth")):
+        return "virtual"
+    if Path(f"/sys/class/net/{ifname}/device").exists():
+        return "ethernet"
+    return "virtual"
+
+
+def network_cards(wan_if, base_lan_if, active_if, hotspot):
+    addr_rows = json.loads(sh(["ip", "-j", "addr"], check=False) or "[]")
+    rows = []
+    for row in addr_rows:
+        ifname = row.get("ifname", "")
+        if not ifname or ifname == "lo":
+            continue
+        roles = []
+        if ifname == wan_if:
+            roles.append("WAN")
+        if ifname == base_lan_if:
+            roles.append("LAN port")
+        if ifname == active_if:
+            roles.append("Gateway")
+        if ifname == hotspot.get("ifname"):
+            roles.append("WiFi AP")
+        if row.get("master") == active_if:
+            roles.append(f"member of {active_if}")
+        addresses = []
+        for info in row.get("addr_info", []):
+            local = info.get("local", "")
+            prefixlen = info.get("prefixlen")
+            if local and prefixlen is not None:
+                addresses.append(f"{local}/{prefixlen}")
+        rows.append(
+            {
+                "name": ifname,
+                "kind": interface_kind(ifname),
+                "state": row.get("operstate", ""),
+                "mac": row.get("address", ""),
+                "master": row.get("master", ""),
+                "role": ", ".join(roles) or "-",
+                "addresses": addresses,
+            }
+        )
+    return rows
 
 
 def proxy_key(proxy):
@@ -457,6 +935,31 @@ def proxy_ip_version(proxy):
 
 def proxy_ip_label(proxy):
     return "IPv6" if proxy_ip_version(proxy) == "6" else "IPv4"
+
+
+def balance_family(value):
+    family = str(value or "all").strip().lower().removeprefix("ipv")
+    if family not in BALANCE_FAMILIES:
+        raise ValueError("Load balance chi ho tro all, IPv4 hoac IPv6")
+    return family
+
+
+def balance_family_label(family):
+    family = balance_family(family)
+    if family == "4":
+        return "IPv4"
+    if family == "6":
+        return "IPv6"
+    return "All"
+
+
+def load_balance_config(state):
+    config = state.get("load_balance", {})
+    try:
+        family = balance_family(config.get("family", "all"))
+    except ValueError:
+        family = "all"
+    return {"enabled": bool(config.get("enabled", False)), "family": family}
 
 
 def proxy_auth_label(proxy):
@@ -913,7 +1416,75 @@ def start_redsocks(proxies, local_ip="127.0.0.1"):
     raise RuntimeError("redsocks khong khoi dong duoc")
 
 
+def dns_guard_reset(lan_if):
+    for proto in ("udp", "tcp"):
+        delete_existing_rule(
+            [
+                "iptables",
+                "-t",
+                "nat",
+                "-D",
+                "PREROUTING",
+                "-i",
+                lan_if,
+                "-p",
+                proto,
+                "--dport",
+                "53",
+                "-j",
+                "REDIRECT",
+                "--to-ports",
+                "53",
+            ]
+        )
+
+
+def filter_guard_reset(lan_if):
+    delete_existing_rule(["iptables", "-D", "FORWARD", "-i", lan_if, "-j", GUARD_CHAIN])
+    sudo(["iptables", "-F", GUARD_CHAIN], check=False)
+    sudo(["iptables", "-X", GUARD_CHAIN], check=False)
+
+
+def apply_dns_guard(lan_if):
+    dns_guard_reset(lan_if)
+    for proto in ("udp", "tcp"):
+        sudo(
+            [
+                "iptables",
+                "-t",
+                "nat",
+                "-I",
+                "PREROUTING",
+                "1",
+                "-i",
+                lan_if,
+                "-p",
+                proto,
+                "--dport",
+                "53",
+                "-j",
+                "REDIRECT",
+                "--to-ports",
+                "53",
+            ]
+        )
+
+
+def apply_filter_guard(lan_if):
+    filter_guard_reset(lan_if)
+    sudo(["iptables", "-N", GUARD_CHAIN], check=False)
+    sudo(["iptables", "-F", GUARD_CHAIN])
+    sudo(["iptables", "-A", GUARD_CHAIN, "-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset"])
+    sudo(["iptables", "-A", GUARD_CHAIN, "-p", "udp", "--dport", "853", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"])
+    for net in PRIVATE_NETS:
+        sudo(["iptables", "-A", GUARD_CHAIN, "-d", net, "-j", "REJECT", "--reject-with", "icmp-port-unreachable"])
+    sudo(["iptables", "-A", GUARD_CHAIN, "-j", "RETURN"])
+    sudo(["iptables", "-I", "FORWARD", "1", "-i", lan_if, "-j", GUARD_CHAIN])
+
+
 def iptables_proxy_reset(lan_if):
+    dns_guard_reset(lan_if)
+    filter_guard_reset(lan_if)
     delete_existing_rule(["iptables", "-t", "nat", "-D", "PREROUTING", "-i", lan_if, "-p", "tcp", "-j", PROXY_CHAIN])
     sudo(["iptables", "-t", "nat", "-F", PROXY_CHAIN], check=False)
     sudo(["iptables", "-t", "nat", "-X", PROXY_CHAIN], check=False)
@@ -1015,11 +1586,92 @@ def list_client_ips(lan_if, lan_cidr):
     return sorted(clients)
 
 
+def ip_sort_key(value):
+    return tuple(int(part) for part in value.split("."))
+
+
+def eligible_proxy_indexes(proxies, family):
+    family = balance_family(family)
+    return [
+        idx
+        for idx, proxy in enumerate(proxies)
+        if family == "all" or proxy_ip_version(proxy) == family
+    ]
+
+
+def balance_client_ips(lan_if, lan_cidr, state):
+    lan_net = ipaddress.ip_interface(lan_cidr).network
+    clients = set(list_client_ips(lan_if, lan_cidr))
+    for ip in state.get("assignments", {}):
+        try:
+            if ipaddress.ip_address(ip) in lan_net:
+                clients.add(ip)
+        except ValueError:
+            continue
+    return sorted(clients, key=ip_sort_key)
+
+
+def proxy_load_counts(assignments, indexes):
+    counts = {idx: 0 for idx in indexes}
+    for value in assignments.values():
+        try:
+            idx = int(value)
+        except (TypeError, ValueError):
+            continue
+        if idx in counts:
+            counts[idx] += 1
+    return counts
+
+
+def rebalance_devices(state, lan_if, family):
+    family = balance_family(family)
+    proxies = state.get("proxies", [])
+    indexes = eligible_proxy_indexes(proxies, family)
+    if not indexes:
+        raise ValueError(f"Khong co proxy {balance_family_label(family)} de can bang")
+    lan_cidr = state.get("lan_cidr", DEFAULT_LAN_CIDR)
+    clients = balance_client_ips(lan_if, lan_cidr, state)
+    assignments = state.setdefault("assignments", {})
+    for pos, client_ip in enumerate(clients):
+        assignments[client_ip] = indexes[pos % len(indexes)]
+    return len(clients)
+
+
+def auto_balance_devices(state, lan_if):
+    config = load_balance_config(state)
+    if not config["enabled"]:
+        return 0
+    proxies = state.get("proxies", [])
+    indexes = eligible_proxy_indexes(proxies, config["family"])
+    if not indexes:
+        return 0
+    lan_cidr = state.get("lan_cidr", DEFAULT_LAN_CIDR)
+    clients = balance_client_ips(lan_if, lan_cidr, state)
+    assignments = state.setdefault("assignments", {})
+    counts = proxy_load_counts(assignments, indexes)
+    changed = 0
+    for client_ip in clients:
+        try:
+            current = int(assignments.get(client_ip))
+        except (TypeError, ValueError):
+            current = None
+        if current in indexes:
+            continue
+        target = min(indexes, key=lambda idx: (counts[idx], idx))
+        assignments[client_ip] = target
+        counts[target] += 1
+        changed += 1
+    return changed
+
+
 def apply_proxy_rules(lan_if):
     state = load_state()
+    if auto_balance_devices(state, lan_if):
+        save_state(state)
     proxies = state.get("proxies", [])
     assignments = state.get("assignments", {})
     lan_cidr = state.get("lan_cidr", DEFAULT_LAN_CIDR)
+    client_ips = set(assignments.keys()) | set(list_client_ips(lan_if, lan_cidr))
     lan_ip, _, _ = cidr_parts(lan_cidr)
     wan_ip = ""
     addr_rows = json.loads(sh(["ip", "-j", "addr"], check=False) or "[]")
@@ -1030,27 +1682,20 @@ def apply_proxy_rules(lan_if):
                     wan_ip = info.get("local", "")
                     break
     iptables_proxy_reset(lan_if)
+    apply_dns_guard(lan_if)
+    apply_filter_guard(lan_if)
     if not proxies or not assignments:
         stop_pid(REDSOCKS_PID)
         stop_redsocks_processes()
         stop_domain_proxy_workers()
+        flush_client_conntrack(client_ips)
         return
     start_redsocks(proxies, lan_ip)
     start_domain_proxy_workers(proxies, lan_ip)
     sudo(["ip6tables", "-I", "FORWARD", "1", "-i", lan_if, "-j", "REJECT"], check=False)
     sudo(["iptables", "-t", "nat", "-N", PROXY_CHAIN], check=False)
     sudo(["iptables", "-t", "nat", "-F", PROXY_CHAIN])
-    for net in (
-        "0.0.0.0/8",
-        "10.0.0.0/8",
-        "100.64.0.0/10",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "224.0.0.0/4",
-        "240.0.0.0/4",
-    ):
+    for net in PRIVATE_NETS:
         sudo(["iptables", "-t", "nat", "-A", PROXY_CHAIN, "-d", net, "-j", "RETURN"])
     for local_target in filter(None, [lan_ip, wan_ip]):
         sudo(["iptables", "-t", "nat", "-A", PROXY_CHAIN, "-d", local_target, "-j", "RETURN"])
@@ -1136,7 +1781,7 @@ def apply_proxy_rules(lan_if):
         )
     sudo(["iptables", "-t", "nat", "-A", PROXY_CHAIN, "-j", "RETURN"])
     sudo(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", lan_if, "-p", "tcp", "-j", PROXY_CHAIN])
-    flush_client_conntrack(assignments.keys())
+    flush_client_conntrack(client_ips)
 
 
 def remove_proxy(index, lan_if):
@@ -1160,10 +1805,16 @@ def remove_proxy(index, lan_if):
 def command_status(wan_if, lan_if):
     state = load_state()
     lan_cidr = state.get("lan_cidr", DEFAULT_LAN_CIDR)
+    base_lan_if = lan_if
+    hotspot = normalized_hotspot(state)
+    lan_if = active_lan_if(base_lan_if, state)
     lan_ip, _, lan_network = cidr_parts(lan_cidr)
     return {
         "wan_if": wan_if,
+        "base_lan_if": base_lan_if,
         "lan_if": lan_if,
+        "wan_mac": current_mac(wan_if),
+        "lan_mac": current_mac(lan_if),
         "lan_ip": lan_ip,
         "lan_network": lan_network,
         "dhcp_range": dhcp_range_for(lan_cidr),
@@ -1171,8 +1822,12 @@ def command_status(wan_if, lan_if):
         "routes": sh(["ip", "route"], check=False),
         "ip_forward": Path("/proc/sys/net/ipv4/ip_forward").read_text().strip(),
         "dnsmasq": pid_alive(DNSMASQ_PID),
+        "hostapd": pid_alive(HOSTAPD_PID),
         "redsocks": pid_alive(REDSOCKS_PID),
-        "leases": list_leases(lan_if, lan_cidr),
+        "leases": list_leases(lan_if, lan_cidr, base_lan_if, hotspot.get("ifname", "")),
+        "network_cards": network_cards(wan_if, base_lan_if, lan_if, hotspot),
+        "wifi_stations": list(wifi_station_details(hotspot.get("ifname", "")).values()),
+        "wifi_interfaces": wireless_interfaces(),
         "state": public_state(state),
     }
 
@@ -1181,13 +1836,47 @@ def render_page(data, message="", proxy_check=None):
     state = data["state"]
     proxies = state.get("proxies", [])
     assignments = state.get("assignments", {})
+    hotspot = normalized_hotspot(state)
+    load_balance = load_balance_config(state)
+    wifi_names = list(data.get("wifi_interfaces", []))
+    if hotspot["ifname"] and hotspot["ifname"] not in wifi_names:
+        wifi_names.insert(0, hotspot["ifname"])
+    selected_wifi = hotspot["ifname"] or (wifi_names[0] if wifi_names else "")
+    wifi_options = "".join(f'<option value="{html.escape(name)}">' for name in wifi_names)
+    hotspot_running = bool(data.get("hostapd"))
+    hotspot_label = "Running" if hotspot_running else ("Configured" if hotspot["enabled"] else "Off")
+    hotspot_password_placeholder = "configured" if hotspot.get("password") else "8-63 chars"
     leases = {lease["ip"]: lease for lease in data["leases"]}
     for assigned_ip in assignments:
         leases.setdefault(
             assigned_ip,
-            {"ip": assigned_ip, "mac": "", "hostname": "", "expires": "", "source": "manual"},
+            {
+                "ip": assigned_ip,
+                "mac": "",
+                "hostname": "",
+                "expires": "",
+                "source": "manual",
+                "connection": "Unknown",
+                "interface": data["lan_if"],
+                "detail": "",
+            },
         )
     leases = [leases[ip] for ip in sorted(leases, key=lambda value: tuple(int(p) for p in value.split(".")))]
+    card_rows = []
+    for card in data.get("network_cards", []):
+        addresses = ", ".join(card.get("addresses", [])) or "-"
+        master = f"master: {card.get('master')}" if card.get("master") else ""
+        card_rows.append(
+            f"""
+            <tr>
+              <td><strong>{html.escape(card['name'])}</strong><span>{html.escape(card.get('kind', ''))}</span></td>
+              <td>{html.escape(card.get('role', '-'))}</td>
+              <td>{html.escape(card.get('state', ''))}</td>
+              <td>{html.escape(card.get('mac', ''))}</td>
+              <td>{html.escape(addresses)}<span>{html.escape(master)}</span></td>
+            </tr>
+            """
+        )
     proxy_options = ["<option value=''>Direct/NAT</option>"]
     for idx, proxy in enumerate(proxies):
         proxy_options.append(
@@ -1205,12 +1894,14 @@ def render_page(data, message="", proxy_check=None):
                 options.append(opt.replace("<option", "<option selected", 1))
             else:
                 options.append(opt)
+        connection_detail = " ".join(filter(None, [lease.get("interface", ""), lease.get("detail", "")]))
         device_rows.append(
             f"""
             <tr>
               <td><strong>{html.escape(ip)}</strong><span>{html.escape(lease.get('source',''))}</span></td>
               <td>{html.escape(lease.get('mac',''))}</td>
               <td>{html.escape(lease.get('hostname',''))}</td>
+              <td><strong>{html.escape(lease.get('connection','Unknown'))}</strong><span>{html.escape(connection_detail)}</span></td>
               <td>
                 <form method="post" action="/assign">
                   <input type="hidden" name="ip" value="{html.escape(ip)}">
@@ -1222,6 +1913,7 @@ def render_page(data, message="", proxy_check=None):
             """
         )
     proxy_rows = []
+    load_counts = proxy_load_counts(assignments, range(len(proxies)))
     for idx, proxy in enumerate(proxies):
         check_label = ""
         if proxy_check and proxy_check.get("index") == idx:
@@ -1239,6 +1931,7 @@ def render_page(data, message="", proxy_check=None):
               <td>{proxy_ip_label(proxy)}</td>
               <td>{html.escape(proxy_auth_label(proxy))}</td>
               <td>{proxy_port(idx)}</td>
+              <td>{load_counts.get(idx, 0)}</td>
               <td>
                 {check_label}
                 <form method="post" action="/proxy/check">
@@ -1256,6 +1949,22 @@ def render_page(data, message="", proxy_check=None):
     assign_options = ["<option value=''>Direct/NAT</option>"]
     for idx, proxy in enumerate(proxies):
         assign_options.append(f"<option value='{idx}'>{html.escape(proxy_key(proxy))}</option>")
+    family_options = []
+    for value in BALANCE_FAMILIES:
+        selected = " selected" if load_balance["family"] == value else ""
+        family_options.append(f"<option value='{value}'{selected}>{balance_family_label(value)}</option>")
+    load_rows = []
+    for idx, proxy in enumerate(proxies):
+        load_rows.append(
+            f"""
+            <tr>
+              <td>{idx}</td>
+              <td>{html.escape(proxy_key(proxy))}</td>
+              <td>{proxy_ip_label(proxy)}</td>
+              <td>{load_counts.get(idx, 0)}</td>
+            </tr>
+            """
+        )
     return f"""<!doctype html>
 <html lang="vi">
 <head>
@@ -1330,6 +2039,14 @@ def render_page(data, message="", proxy_check=None):
     }}
     .proxy-form label {{ display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }}
     .proxy-form input, .proxy-form select {{ width: 100%; min-width: 0; }}
+    .hotspot-form {{
+      display: grid;
+      grid-template-columns: minmax(130px, 170px) minmax(180px, 1fr) minmax(170px, 1fr) minmax(90px, 120px) auto;
+      gap: 8px;
+      align-items: end;
+    }}
+    .hotspot-form label {{ display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }}
+    .hotspot-form input {{ width: 100%; min-width: 0; }}
     .url-form {{ margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--line); }}
     button {{
       border: 0;
@@ -1365,6 +2082,7 @@ def render_page(data, message="", proxy_check=None):
       form {{ align-items: stretch; }}
       select, button, input {{ width: 100%; }}
       .proxy-form {{ grid-template-columns: 1fr; }}
+      .hotspot-form {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -1386,26 +2104,104 @@ def render_page(data, message="", proxy_check=None):
       <h2>Router</h2>
       <div class="grid">
         <div class="metric"><b>DHCP/NAT</b><span class="{ 'ok' if data['dnsmasq'] else 'bad' }">{'Running' if data['dnsmasq'] else 'Stopped'}</span></div>
+        <div class="metric"><b>WiFi Hotspot</b><span class="{ 'ok' if hotspot_running else 'bad' }">{html.escape(hotspot_label)}</span></div>
         <div class="metric"><b>IP Forward</b><span class="{ 'ok' if data['ip_forward'] == '1' else 'bad' }">{html.escape(data['ip_forward'])}</span></div>
         <div class="metric"><b>Proxy Engine</b><span class="{ 'ok' if data['redsocks'] else 'bad' }">{'Running' if data['redsocks'] else 'Stopped'}</span></div>
         <div class="metric"><b>DHCP Range</b><span>{html.escape(data['dhcp_range'][0])} - {html.escape(data['dhcp_range'][1])}</span></div>
+        <div class="metric"><b>WAN MAC</b><span>{html.escape(data['wan_mac'])}</span></div>
+        <div class="metric"><b>LAN MAC</b><span>{html.escape(data['lan_mac'])}</span></div>
+        <div class="metric"><b>DNS/WebRTC Guard</b><span class="ok">Strict</span></div>
+        <div class="metric"><b>LAN Isolation</b><span class="ok">Enabled</span></div>
       </div>
       <div class="actions" style="margin-top:14px">
         <form method="post" action="/setup"><button class="primary">Apply LAN Router Config</button></form>
+        <form method="post" action="/mac/rotate">
+          <input type="hidden" name="target" value="wan">
+          <button class="neutral">Rotate WAN MAC</button>
+        </form>
+        <form method="post" action="/mac/rotate">
+          <input type="hidden" name="target" value="lan">
+          <button class="neutral">Rotate LAN MAC</button>
+        </form>
         <form method="post" action="/stop"><button class="danger">Stop Test Router</button></form>
       </div>
     </section>
     <section>
+      <h2>WiFi Hotspot</h2>
+      <div class="grid">
+        <div class="metric"><b>Interface</b><span>{html.escape(hotspot['ifname'] or selected_wifi or 'none')}</span></div>
+        <div class="metric"><b>SSID</b><span>{html.escape(hotspot['ssid'])}</span></div>
+        <div class="metric"><b>Channel</b><span>{html.escape(str(hotspot['channel']))}</span></div>
+        <div class="metric"><b>LAN Output</b><span>{html.escape(data['lan_if'])}</span></div>
+      </div>
+      <form method="post" action="/hotspot/save" style="margin-top:14px">
+        <div class="hotspot-form">
+          <label>WiFi Card
+            <input type="text" name="ifname" list="wifi-ifaces" value="{html.escape(selected_wifi)}" placeholder="wlan0">
+            <datalist id="wifi-ifaces">{wifi_options}</datalist>
+          </label>
+          <label>Ten WiFi
+            <input type="text" name="ssid" maxlength="32" value="{html.escape(hotspot['ssid'])}" placeholder="RouterWiFi">
+          </label>
+          <label>Password
+            <input type="password" name="password" autocomplete="new-password" placeholder="{html.escape(hotspot_password_placeholder)}">
+          </label>
+          <label>Channel
+            <input type="number" name="channel" min="1" max="13" value="{html.escape(str(hotspot['channel']))}">
+          </label>
+          <button class="primary">Start Hotspot</button>
+        </div>
+      </form>
+      <div class="actions" style="margin-top:12px">
+        <form method="post" action="/hotspot/stop"><button class="danger">Stop Hotspot</button></form>
+      </div>
+    </section>
+    <section>
+      <h2>Network Cards</h2>
+      <table>
+        <thead><tr><th>Interface</th><th>Role</th><th>State</th><th>MAC</th><th>Addresses</th></tr></thead>
+        <tbody>{''.join(card_rows) if card_rows else '<tr><td colspan="5">Khong doc duoc card mang.</td></tr>'}</tbody>
+      </table>
+    </section>
+    <section>
       <h2>Devices</h2>
       <table>
-        <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Proxy</th></tr></thead>
-        <tbody>{''.join(device_rows) if device_rows else '<tr><td colspan="4">Chua thay thiet bi nao. Cam laptop vao cong LAN out roi cho 5-10 giay.</td></tr>'}</tbody>
+        <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Connection</th><th>Proxy</th></tr></thead>
+        <tbody>{''.join(device_rows) if device_rows else '<tr><td colspan="5">Chua thay thiet bi nao. Ket noi thiet bi vao LAN/WiFi roi cho 5-10 giay.</td></tr>'}</tbody>
       </table>
       <form method="post" action="/assign" style="margin-top:14px">
         <input type="text" name="ip" placeholder="Gan thu cong IP, vi du 10.42.0.50">
         <select name="proxy">{''.join(assign_options)}</select>
         <button>Assign IP</button>
       </form>
+    </section>
+    <section>
+      <h2>Load Balance</h2>
+      <div class="grid">
+        <div class="metric"><b>Auto Balance</b><span class="{ 'ok' if load_balance['enabled'] else 'bad' }">{'Enabled' if load_balance['enabled'] else 'Off'}</span></div>
+        <div class="metric"><b>Pool</b><span>{balance_family_label(load_balance['family'])}</span></div>
+        <div class="metric"><b>Devices</b><span>{len(assignments)}</span></div>
+        <div class="metric"><b>Proxies</b><span>{len(proxies)}</span></div>
+      </div>
+      <div class="actions" style="margin-top:14px">
+        <form method="post" action="/balance/apply">
+          <select name="family">{''.join(family_options)}</select>
+          <button class="primary">Balance Now</button>
+        </form>
+        <form method="post" action="/balance/auto">
+          <input type="hidden" name="action" value="enable">
+          <select name="family">{''.join(family_options)}</select>
+          <button>Enable Auto</button>
+        </form>
+        <form method="post" action="/balance/auto">
+          <input type="hidden" name="action" value="disable">
+          <button class="neutral">Disable Auto</button>
+        </form>
+      </div>
+      <table style="margin-top:12px">
+        <thead><tr><th>#</th><th>Proxy</th><th>IP</th><th>Devices</th></tr></thead>
+        <tbody>{''.join(load_rows) if load_rows else '<tr><td colspan="4">Chua co proxy de can bang tai.</td></tr>'}</tbody>
+      </table>
     </section>
     <section>
       <h2>Proxy</h2>
@@ -1449,8 +2245,8 @@ def render_page(data, message="", proxy_check=None):
         <button>Add Proxy</button>
       </form>
       <table style="margin-top:12px">
-        <thead><tr><th>Upstream proxy</th><th>Proxy IP</th><th>Auth</th><th>Local port</th><th>Action</th></tr></thead>
-        <tbody>{''.join(proxy_rows) if proxy_rows else '<tr><td colspan="5">Chua co proxy. Thiet bi hien dang di Direct/NAT.</td></tr>'}</tbody>
+        <thead><tr><th>Upstream proxy</th><th>Proxy IP</th><th>Auth</th><th>Local port</th><th>Load</th><th>Action</th></tr></thead>
+        <tbody>{''.join(proxy_rows) if proxy_rows else '<tr><td colspan="6">Chua co proxy. Thiet bi hien dang di Direct/NAT.</td></tr>'}</tbody>
       </table>
     </section>
     <section>
@@ -1609,6 +2405,9 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode()
         return {key: values[0] for key, values in parse_qs(body).items()}
 
+    def current_lan_if(self):
+        return active_lan_if(self.lan_if)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/logout":
@@ -1636,6 +2435,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.is_authenticated():
             self.send_response(303)
             self.send_header("Location", "/login")
+            self.end_headers()
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1656,14 +2456,91 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if self.path == "/setup":
-                ensure_router(self.wan_if, self.lan_if, self.lan_cidr)
-                apply_proxy_rules(self.lan_if)
-                self.redirect("Router config applied")
+                lan_if = apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                self.redirect(f"Router config applied on {lan_if}")
                 return
             if self.path == "/stop":
-                stop_router(self.wan_if, self.lan_if)
+                state = load_state()
+                lan_if = active_lan_if(self.lan_if, state)
+                stop_router(self.wan_if, lan_if)
+                if lan_if != self.lan_if:
+                    stop_router(self.wan_if, self.lan_if)
                 self.redirect("Router stopped")
                 return
+            if self.path == "/mac/rotate":
+                target = self.form().get("target", "")
+                if target == "wan":
+                    _, new_mac = rotate_interface_mac(self.wan_if)
+                    apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                    self.redirect(f"WAN MAC rotated: {new_mac}")
+                    return
+                if target == "lan":
+                    _, new_mac = rotate_interface_mac(self.current_lan_if())
+                    apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                    self.redirect(f"LAN MAC rotated: {new_mac}")
+                    return
+                raise ValueError("MAC target khong hop le")
+            if self.path == "/hotspot/save":
+                data = self.form()
+                state = load_state()
+                old_hotspot = normalized_hotspot(state)
+                old_lan_if = active_lan_if(self.lan_if, state)
+                new_hotspot = parse_hotspot_form(data, state, self.wan_if)
+                if old_hotspot["enabled"] and old_hotspot["ifname"] != new_hotspot["ifname"]:
+                    stop_hotspot(old_hotspot)
+                state["hotspot"] = new_hotspot
+                new_lan_if = active_lan_if(self.lan_if, state)
+                if old_lan_if != new_lan_if:
+                    stop_router(self.wan_if, old_lan_if)
+                save_state(state)
+                lan_if = apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                self.redirect(f"WiFi hotspot started on {lan_if}")
+                return
+            if self.path == "/hotspot/stop":
+                state = load_state()
+                hotspot = normalized_hotspot(state)
+                old_lan_if = active_lan_if(self.lan_if, state)
+                was_enabled = hotspot["enabled"]
+                hotspot["enabled"] = False
+                state["hotspot"] = hotspot
+                save_state(state)
+                if was_enabled:
+                    stop_router(self.wan_if, old_lan_if)
+                    lan_if = apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                    self.redirect(f"WiFi hotspot stopped; LAN output {lan_if}")
+                    return
+                stop_hotspot(hotspot)
+                self.redirect("WiFi hotspot stopped")
+                return
+            if self.path == "/balance/apply":
+                data = self.form()
+                family = balance_family(data.get("family", "all"))
+                state = load_state()
+                count = rebalance_devices(state, self.current_lan_if(), family)
+                state["load_balance"] = {"enabled": False, "family": family}
+                save_state(state)
+                apply_proxy_rules(self.current_lan_if())
+                self.redirect(f"Balanced {count} devices across {balance_family_label(family)} proxies")
+                return
+            if self.path == "/balance/auto":
+                data = self.form()
+                action = data.get("action", "")
+                family = balance_family(data.get("family", "all"))
+                state = load_state()
+                if action == "enable":
+                    count = rebalance_devices(state, self.current_lan_if(), family)
+                    state["load_balance"] = {"enabled": True, "family": family}
+                    save_state(state)
+                    apply_proxy_rules(self.current_lan_if())
+                    self.redirect(f"Auto balance enabled: {count} devices on {balance_family_label(family)}")
+                    return
+                if action == "disable":
+                    state["load_balance"] = {"enabled": False, "family": family}
+                    save_state(state)
+                    apply_proxy_rules(self.current_lan_if())
+                    self.redirect("Auto balance disabled")
+                    return
+                raise ValueError("Load balance action khong hop le")
             if self.path == "/proxy/add":
                 data = self.form()
                 proxy = parse_proxy_form(data)
@@ -1672,7 +2549,7 @@ class Handler(BaseHTTPRequestHandler):
                 if proxy_identity(proxy) not in [proxy_identity(item) for item in state["proxies"]]:
                     state["proxies"].append(proxy)
                 save_state(state)
-                apply_proxy_rules(self.lan_if)
+                apply_proxy_rules(self.current_lan_if())
                 self.redirect("Proxy added")
                 return
             if self.path == "/proxy/check":
@@ -1683,7 +2560,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/proxy/delete":
                 idx = int(self.form().get("index", "-1"))
-                remove_proxy(idx, self.lan_if)
+                remove_proxy(idx, self.current_lan_if())
                 self.redirect("Proxy deleted")
                 return
             if self.path == "/assign":
@@ -1701,7 +2578,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Proxy index khong hop le")
                     state["assignments"][client_ip] = idx
                 save_state(state)
-                apply_proxy_rules(self.lan_if)
+                apply_proxy_rules(self.current_lan_if())
                 self.redirect("Assignment saved")
                 return
             self.respond("not found", status=404)
@@ -1732,9 +2609,13 @@ def main():
     if not args.wan or not args.lan:
         raise SystemExit("Khong detect duoc WAN/LAN interface")
     if args.stop:
+        state = load_state()
+        lan_if = active_lan_if(args.lan, state)
         stop_web_server()
-        stop_router(args.wan, args.lan)
-        print(f"Stopped router services/rules for WAN={args.wan} LAN={args.lan}")
+        stop_router(args.wan, lan_if)
+        if lan_if != args.lan:
+            stop_router(args.wan, args.lan)
+        print(f"Stopped router services/rules for WAN={args.wan} LAN={lan_if}")
         return
     if args.replace:
         stop_web_server()
@@ -1748,8 +2629,7 @@ def main():
     Handler.admin_password = load_or_create_admin_password()
     Handler.session_token = load_or_create_session_token()
     if args.apply:
-        ensure_router(args.wan, args.lan, args.lan_cidr)
-        apply_proxy_rules(args.lan)
+        apply_router_stack(args.wan, args.lan, args.lan_cidr)
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     WEB_PID.write_text(str(os.getpid()))
