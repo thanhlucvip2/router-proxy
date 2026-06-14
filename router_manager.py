@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import html
 import ipaddress
 import json
 import os
+import select
 import shlex
 import shutil
 import signal
+import socket
 import secrets
+import struct
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +29,7 @@ DNSMASQ_LEASES = STATE_DIR / "dnsmasq.leases"
 DNSMASQ_PID = STATE_DIR / "dnsmasq.pid"
 REDSOCKS_CONF = STATE_DIR / "redsocks.conf"
 REDSOCKS_PID = STATE_DIR / "redsocks.pid"
+DOMAIN_PROXY_PREFIX = "domain_proxy"
 WEB_PID = STATE_DIR / "router_manager.pid"
 ADMIN_PASSWORD_FILE = STATE_DIR / "admin_password.txt"
 SESSION_FILE = STATE_DIR / "session_token.txt"
@@ -33,7 +39,10 @@ DEFAULT_ADMIN_USER = "admin"
 PROXY_CHAIN = "ROUTER_PROXY"
 PROXY_LOCAL_BASE = 23450
 PROXY_TYPES = ("http", "https", "socks5", "socks4")
-PROXY_TEST_URL = "https://api.ipify.org"
+PROXY_TEST_URLS = {
+    "4": "https://api.ipify.org",
+    "6": "https://api6.ipify.org",
+}
 
 
 def sh(cmd, check=True, capture=True):
@@ -203,6 +212,77 @@ def stop_pid(pid_file):
     Path(pid_file).unlink(missing_ok=True)
 
 
+def stop_redsocks_processes():
+    proc_rows = sh(["ps", "-eo", "pid,args"], check=False)
+    conf_path = str(REDSOCKS_CONF)
+    for line in proc_rows.splitlines():
+        line = line.strip()
+        if not line or "redsocks" not in line or conf_path not in line:
+            continue
+        pid_text, _, _ = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            sudo(["kill", f"-{sig.name.removeprefix('SIG')}", str(pid)], check=False)
+            for _ in range(10):
+                time.sleep(0.1)
+                if not sudo_success(["kill", "-0", str(pid)]):
+                    break
+            if not sudo_success(["kill", "-0", str(pid)]):
+                break
+    REDSOCKS_PID.unlink(missing_ok=True)
+
+
+def domain_proxy_pid_file(port):
+    return STATE_DIR / f"{DOMAIN_PROXY_PREFIX}_{port}.pid"
+
+
+def domain_proxy_conf_file(port):
+    return STATE_DIR / f"{DOMAIN_PROXY_PREFIX}_{port}.json"
+
+
+def domain_proxy_log_file(port):
+    return STATE_DIR / f"{DOMAIN_PROXY_PREFIX}_{port}.log"
+
+
+def stop_domain_proxy_workers():
+    for pid_file in STATE_DIR.glob(f"{DOMAIN_PROXY_PREFIX}_*.pid"):
+        stop_pid(pid_file)
+    proc_rows = sh(["ps", "-eo", "pid,args"], check=False)
+    script_path = str(Path(__file__).resolve())
+    for line in proc_rows.splitlines():
+        line = line.strip()
+        if "--domain-proxy-worker" not in line:
+            continue
+        pid_text, _, args = line.partition(" ")
+        try:
+            argv = shlex.split(args)
+            pid = int(pid_text)
+        except (ValueError, IndexError):
+            continue
+        if not argv or Path(argv[0]).name not in ("python", "python3"):
+            continue
+        if len(argv) < 2:
+            continue
+        try:
+            if str(Path(argv[1]).resolve()) != script_path:
+                continue
+        except OSError:
+            continue
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            sudo(["kill", f"-{sig.name.removeprefix('SIG')}", str(pid)], check=False)
+            for _ in range(10):
+                time.sleep(0.1)
+                if not sudo_success(["kill", "-0", str(pid)]):
+                    break
+            if not sudo_success(["kill", "-0", str(pid)]):
+                break
+    for path in STATE_DIR.glob(f"{DOMAIN_PROXY_PREFIX}_*.pid"):
+        path.unlink(missing_ok=True)
+
+
 def stop_web_server():
     targets = set()
     try:
@@ -318,6 +398,8 @@ def ensure_router(wan_if, lan_if, lan_cidr):
 def stop_router(wan_if, lan_if):
     iptables_proxy_reset(lan_if)
     stop_pid(REDSOCKS_PID)
+    stop_redsocks_processes()
+    stop_domain_proxy_workers()
     stop_pid(DNSMASQ_PID)
     delete_existing_rule(["iptables", "-t", "nat", "-D", "POSTROUTING", "-o", wan_if, "-j", "MASQUERADE"])
     for rule in (
@@ -365,7 +447,16 @@ def list_leases(lan_if, lan_cidr):
 
 def proxy_key(proxy):
     auth = f"{proxy.get('login', '')}@" if proxy.get("login") else ""
-    return f"{proxy['type']}://{auth}{proxy['host']}:{proxy['port']}"
+    return f"{proxy['type']}://{auth}{format_host_port(proxy['host'], proxy['port'])} [{proxy_ip_label(proxy)}]"
+
+
+def proxy_ip_version(proxy):
+    version = str(proxy.get("ip_version", "4")).lower().removeprefix("ipv")
+    return version if version in ("4", "6") else "4"
+
+
+def proxy_ip_label(proxy):
+    return "IPv6" if proxy_ip_version(proxy) == "6" else "IPv4"
 
 
 def proxy_auth_label(proxy):
@@ -374,6 +465,13 @@ def proxy_auth_label(proxy):
     if proxy.get("login"):
         return "user only"
     return "none"
+
+
+def is_ipv6_literal(value):
+    try:
+        return ipaddress.ip_address(value).version == 6
+    except ValueError:
+        return False
 
 
 def shell_quote(value):
@@ -387,6 +485,7 @@ def proxy_identity(proxy):
         int(proxy.get("port", 0)),
         proxy.get("login", ""),
         proxy.get("password", ""),
+        proxy_ip_version(proxy),
     )
 
 
@@ -394,7 +493,29 @@ def proxy_port(index):
     return PROXY_LOCAL_BASE + index
 
 
-def parse_proxy_url(value):
+def parse_proxy_ip_version(value):
+    version = str(value or "4").strip().lower().removeprefix("ipv")
+    if version not in ("4", "6"):
+        raise ValueError("Proxy IP phai la IPv4 hoac IPv6")
+    return version
+
+
+def normalize_proxy_host(host):
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
+def format_proxy_host(host):
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def format_host_port(host, port):
+    return f"{format_proxy_host(str(host))}:{port}"
+
+
+def parse_proxy_url(value, ip_version="4"):
     value = value.strip()
     if not value:
         raise ValueError("Proxy URL dang trong")
@@ -409,15 +530,17 @@ def parse_proxy_url(value):
         "port": parsed.port,
         "login": unquote(parsed.username or ""),
         "password": unquote(parsed.password or ""),
+        "ip_version": parse_proxy_ip_version(ip_version),
     }
 
 
 def parse_proxy_form(data):
+    ip_version = parse_proxy_ip_version(data.get("ip_version", "4"))
     proxy_url = data.get("url", "").strip()
     if proxy_url:
-        return parse_proxy_url(proxy_url)
+        return parse_proxy_url(proxy_url, ip_version)
     proxy_type = data.get("type", "").strip().lower()
-    host = data.get("host", "").strip()
+    host = normalize_proxy_host(data.get("host", ""))
     port_value = data.get("port", "").strip()
     if proxy_type not in PROXY_TYPES:
         raise ValueError("Proxy type khong hop le")
@@ -437,6 +560,7 @@ def parse_proxy_form(data):
         "port": port,
         "login": data.get("login", "").strip(),
         "password": data.get("password", ""),
+        "ip_version": ip_version,
     }
 
 
@@ -447,7 +571,9 @@ def proxy_url(proxy):
         if proxy.get("password"):
             auth += ":" + quote(proxy["password"], safe="")
         auth += "@"
-    return f"http://{auth}{proxy['host']}:{proxy['port']}"
+    proxy_type = proxy.get("type", "http")
+    scheme = {"socks5": "socks5h", "socks4": "socks4a"}.get(proxy_type, "http")
+    return f"{scheme}://{auth}{format_host_port(proxy['host'], proxy['port'])}"
 
 
 def check_proxy(index):
@@ -458,13 +584,12 @@ def check_proxy(index):
     proxy = proxies[index]
     cmd = [
         "curl",
-        "-4",
         "-sS",
         "--max-time",
         "12",
         "-x",
         proxy_url(proxy),
-        PROXY_TEST_URL,
+        PROXY_TEST_URLS[proxy_ip_version(proxy)],
     ]
     result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     body = (result.stdout or "").strip()
@@ -484,7 +609,263 @@ def redsocks_type(proxy_type):
     return proxy_type
 
 
+def use_domain_proxy(proxy):
+    return proxy_ip_version(proxy) == "6" and proxy.get("type") in ("http", "https")
+
+
+def parse_host_port(value, default_port):
+    value = value.strip()
+    if value.startswith("["):
+        end = value.find("]")
+        if end != -1:
+            host = value[1:end]
+            rest = value[end + 1 :]
+            if rest.startswith(":") and rest[1:].isdigit():
+                return host, int(rest[1:])
+            return host, default_port
+    if value.count(":") == 1:
+        host, port = value.rsplit(":", 1)
+        if port.isdigit():
+            return host, int(port)
+    return value, default_port
+
+
+def parse_http_target(data, default_port):
+    try:
+        text = data.decode("iso-8859-1", "ignore")
+    except UnicodeDecodeError:
+        return None
+    line_end = text.find("\r\n")
+    if line_end == -1:
+        return None
+    first_line = text[:line_end]
+    parts = first_line.split()
+    if not parts:
+        return None
+    method = parts[0].upper()
+    methods = {"GET", "POST", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
+    if method not in methods:
+        return None
+    if method == "CONNECT" and len(parts) >= 2:
+        return parse_host_port(parts[1], default_port)
+    for line in text[line_end + 2 :].split("\r\n"):
+        if not line:
+            break
+        key, sep, value = line.partition(":")
+        if sep and key.lower() == "host":
+            return parse_host_port(value, default_port)
+    return None
+
+
+def parse_tls_sni(data):
+    try:
+        if len(data) < 5 or data[0] != 22:
+            return None
+        record_len = int.from_bytes(data[3:5], "big")
+        if len(data) < min(5 + record_len, 64):
+            return None
+        pos = 5
+        if data[pos] != 1:
+            return None
+        handshake_len = int.from_bytes(data[pos + 1 : pos + 4], "big")
+        end = min(len(data), pos + 4 + handshake_len)
+        pos += 4 + 2 + 32
+        if pos >= end:
+            return None
+        session_len = data[pos]
+        pos += 1 + session_len
+        if pos + 2 > end:
+            return None
+        cipher_len = int.from_bytes(data[pos : pos + 2], "big")
+        pos += 2 + cipher_len
+        if pos >= end:
+            return None
+        compression_len = data[pos]
+        pos += 1 + compression_len
+        if pos + 2 > end:
+            return None
+        extensions_len = int.from_bytes(data[pos : pos + 2], "big")
+        pos += 2
+        extensions_end = min(end, pos + extensions_len)
+        while pos + 4 <= extensions_end:
+            ext_type = int.from_bytes(data[pos : pos + 2], "big")
+            ext_len = int.from_bytes(data[pos + 2 : pos + 4], "big")
+            pos += 4
+            ext_end = pos + ext_len
+            if ext_type == 0 and pos + 2 <= ext_end:
+                list_len = int.from_bytes(data[pos : pos + 2], "big")
+                name_pos = pos + 2
+                list_end = min(ext_end, name_pos + list_len)
+                while name_pos + 3 <= list_end:
+                    name_type = data[name_pos]
+                    name_len = int.from_bytes(data[name_pos + 1 : name_pos + 3], "big")
+                    name_pos += 3
+                    if name_type == 0 and name_pos + name_len <= list_end:
+                        return data[name_pos : name_pos + name_len].decode("idna")
+                    name_pos += name_len
+            pos = ext_end
+    except (IndexError, UnicodeError):
+        return None
+    return None
+
+
+def original_dst(client):
+    try:
+        data = client.getsockopt(socket.SOL_IP, 80, 16)
+        port = struct.unpack_from("!H", data, 2)[0]
+        host = socket.inet_ntoa(data[4:8])
+        return host, port
+    except OSError:
+        return "", 443
+
+
+def detect_domain_proxy_target(client, listen_port=None):
+    original_host, original_port = original_dst(client)
+    if listen_port and original_port == listen_port:
+        original_port = 443
+    client.settimeout(5)
+    data = b""
+    deadline = time.time() + 5
+    while time.time() < deadline and len(data) < 16384:
+        try:
+            data = client.recv(16384, socket.MSG_PEEK)
+        except socket.timeout:
+            break
+        if not data:
+            break
+        http_target = parse_http_target(data, original_port)
+        if http_target:
+            return http_target
+        sni = parse_tls_sni(data)
+        if sni:
+            return sni, original_port
+        if b"\r\n\r\n" in data or len(data) >= 4096:
+            break
+        time.sleep(0.05)
+    return original_host, original_port
+
+
+def connect_http_proxy(proxy, target_host, target_port):
+    upstream = socket.create_connection((proxy["host"], int(proxy["port"])), timeout=12)
+    host_header = format_host_port(target_host, target_port)
+    lines = [
+        f"CONNECT {host_header} HTTP/1.1",
+        f"Host: {host_header}",
+        "Proxy-Connection: keep-alive",
+    ]
+    if proxy.get("login"):
+        token = f"{proxy.get('login', '')}:{proxy.get('password', '')}".encode()
+        lines.append("Proxy-Authorization: Basic " + base64.b64encode(token).decode("ascii"))
+    payload = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
+    upstream.sendall(payload)
+    response = b""
+    upstream.settimeout(12)
+    while b"\r\n\r\n" not in response and len(response) < 16384:
+        chunk = upstream.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    status_line = response.split(b"\r\n", 1)[0]
+    if b" 200 " not in status_line:
+        raise RuntimeError(status_line.decode("iso-8859-1", "ignore") or "proxy connect failed")
+    upstream.settimeout(None)
+    return upstream
+
+
+def relay_sockets(left, right):
+    sockets = [left, right]
+    try:
+        while True:
+            readable, _, errored = select.select(sockets, [], sockets, 300)
+            if errored:
+                return
+            if not readable:
+                return
+            for sock in readable:
+                data = sock.recv(65536)
+                if not data:
+                    return
+                (right if sock is left else left).sendall(data)
+    finally:
+        for sock in sockets:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def handle_domain_proxy_client(client, addr, proxy, listen_port=None):
+    target_host = ""
+    target_port = 0
+    try:
+        target_host, target_port = detect_domain_proxy_target(client, listen_port)
+        if not target_host:
+            return
+        upstream = connect_http_proxy(proxy, target_host, target_port)
+        relay_sockets(client, upstream)
+    except Exception as exc:
+        target = f" target={target_host}:{target_port}" if target_host else ""
+        sys.stderr.write(f"domain-proxy client {addr}{target}: {exc}\n")
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+def run_domain_proxy_worker(config_path):
+    config = json.loads(Path(config_path).read_text())
+    proxy = config["proxy"]
+    listen_ip = config["listen_ip"]
+    listen_port = int(config["listen_port"])
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((listen_ip, listen_port))
+    server.listen(256)
+    sys.stderr.write(f"domain-proxy listening on {listen_ip}:{listen_port}\n")
+    while True:
+        client, addr = server.accept()
+        thread = threading.Thread(
+            target=handle_domain_proxy_client,
+            args=(client, addr, proxy, listen_port),
+            daemon=True,
+        )
+        thread.start()
+
+
+def start_domain_proxy_workers(proxies, local_ip):
+    stop_domain_proxy_workers()
+    for idx, proxy in enumerate(proxies):
+        if not use_domain_proxy(proxy):
+            continue
+        port = proxy_port(idx)
+        config = {
+            "listen_ip": local_ip,
+            "listen_port": port,
+            "proxy": proxy,
+        }
+        conf_file = domain_proxy_conf_file(port)
+        conf_file.write_text(json.dumps(config, indent=2, sort_keys=True))
+        conf_file.chmod(0o600)
+        log_file = domain_proxy_log_file(port)
+        log = log_file.open("ab")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--domain-proxy-worker", str(conf_file)],
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+        finally:
+            log.close()
+        domain_proxy_pid_file(port).write_text(str(proc.pid))
+        for _ in range(10):
+            time.sleep(0.1)
+            if pid_alive(domain_proxy_pid_file(port)):
+                break
+
+
 def write_redsocks_conf(proxies, local_ip="127.0.0.1"):
+    proxy_items = [(idx, proxy) for idx, proxy in enumerate(proxies) if not use_domain_proxy(proxy)]
     blocks = [
         "base {",
         "  log_debug = off;",
@@ -495,7 +876,7 @@ def write_redsocks_conf(proxies, local_ip="127.0.0.1"):
         "}",
         "",
     ]
-    for idx, proxy in enumerate(proxies):
+    for idx, proxy in proxy_items:
         blocks.extend(
             [
                 "redsocks {",
@@ -517,7 +898,9 @@ def write_redsocks_conf(proxies, local_ip="127.0.0.1"):
 def start_redsocks(proxies, local_ip="127.0.0.1"):
     require_commands(["redsocks"])
     stop_pid(REDSOCKS_PID)
-    if not proxies:
+    stop_redsocks_processes()
+    if not any(not use_domain_proxy(proxy) for proxy in proxies):
+        REDSOCKS_CONF.write_text("")
         return
     write_redsocks_conf(proxies, local_ip)
     sudo(["systemctl", "stop", "redsocks"], check=False)
@@ -649,8 +1032,11 @@ def apply_proxy_rules(lan_if):
     iptables_proxy_reset(lan_if)
     if not proxies or not assignments:
         stop_pid(REDSOCKS_PID)
+        stop_redsocks_processes()
+        stop_domain_proxy_workers()
         return
     start_redsocks(proxies, lan_ip)
+    start_domain_proxy_workers(proxies, lan_ip)
     sudo(["ip6tables", "-I", "FORWARD", "1", "-i", lan_if, "-j", "REJECT"], check=False)
     sudo(["iptables", "-t", "nat", "-N", PROXY_CHAIN], check=False)
     sudo(["iptables", "-t", "nat", "-F", PROXY_CHAIN])
@@ -680,25 +1066,26 @@ def apply_proxy_rules(lan_if):
             continue
         proxy = proxies[idx]
         # Let explicit connections to the upstream proxy pass, avoiding accidental loops.
-        sudo(
-            [
-                "iptables",
-                "-t",
-                "nat",
-                "-A",
-                PROXY_CHAIN,
-                "-s",
-                client_ip,
-                "-p",
-                "tcp",
-                "-d",
-                proxy["host"],
-                "--dport",
-                str(proxy["port"]),
-                "-j",
-                "RETURN",
-            ]
-        )
+        if not is_ipv6_literal(proxy["host"]):
+            sudo(
+                [
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-A",
+                    PROXY_CHAIN,
+                    "-s",
+                    client_ip,
+                    "-p",
+                    "tcp",
+                    "-d",
+                    proxy["host"],
+                    "--dport",
+                    str(proxy["port"]),
+                    "-j",
+                    "RETURN",
+                ]
+            )
         delete_existing_rule(
             [
                 "iptables",
@@ -847,8 +1234,9 @@ def render_page(data, message="", proxy_check=None):
             <tr>
               <td>
                 <strong>{html.escape(proxy['type'].upper())}</strong>
-                <span>{html.escape(proxy['host'])}:{html.escape(str(proxy['port']))}</span>
+                <span>{html.escape(format_host_port(proxy['host'], proxy['port']))}</span>
               </td>
+              <td>{proxy_ip_label(proxy)}</td>
               <td>{html.escape(proxy_auth_label(proxy))}</td>
               <td>{proxy_port(idx)}</td>
               <td>
@@ -913,7 +1301,7 @@ def render_page(data, message="", proxy_check=None):
       padding: 18px;
     }}
     h2 {{ font-size: 17px; margin: 0 0 14px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
+      .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
     .metric {{ border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 74px; }}
     .metric b {{ display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
     .ok {{ color: var(--accent); font-weight: 700; }}
@@ -936,7 +1324,7 @@ def render_page(data, message="", proxy_check=None):
     input[type=number] {{ width: 120px; }}
     .proxy-form {{
       display: grid;
-      grid-template-columns: minmax(110px, 140px) minmax(180px, 1fr) minmax(90px, 120px) minmax(150px, 1fr) minmax(150px, 1fr) auto;
+      grid-template-columns: minmax(110px, 130px) minmax(100px, 120px) minmax(180px, 1fr) minmax(90px, 120px) minmax(150px, 1fr) minmax(150px, 1fr) auto;
       gap: 8px;
       align-items: end;
     }}
@@ -1031,6 +1419,12 @@ def render_page(data, message="", proxy_check=None):
               <option value="socks4">SOCKS4</option>
             </select>
           </label>
+          <label>Proxy IP
+            <select name="ip_version">
+              <option value="4">IPv4</option>
+              <option value="6">IPv6</option>
+            </select>
+          </label>
           <label>Host
             <input type="text" name="host" placeholder="proxy.example.com">
           </label>
@@ -1048,11 +1442,15 @@ def render_page(data, message="", proxy_check=None):
       </form>
       <form class="url-form" method="post" action="/proxy/add">
         <input type="text" name="url" placeholder="Hoac dan URL: socks5://user:pass@host:port">
+        <select name="ip_version">
+          <option value="4">IPv4</option>
+          <option value="6">IPv6</option>
+        </select>
         <button>Add Proxy</button>
       </form>
       <table style="margin-top:12px">
-        <thead><tr><th>Upstream proxy</th><th>Auth</th><th>Local port</th><th>Action</th></tr></thead>
-        <tbody>{''.join(proxy_rows) if proxy_rows else '<tr><td colspan="4">Chua co proxy. Thiet bi hien dang di Direct/NAT.</td></tr>'}</tbody>
+        <thead><tr><th>Upstream proxy</th><th>Proxy IP</th><th>Auth</th><th>Local port</th><th>Action</th></tr></thead>
+        <tbody>{''.join(proxy_rows) if proxy_rows else '<tr><td colspan="5">Chua co proxy. Thiet bi hien dang di Direct/NAT.</td></tr>'}</tbody>
       </table>
     </section>
     <section>
@@ -1325,7 +1723,11 @@ def main():
     parser.add_argument("--stop", action="store_true", help="stop dnsmasq/redsocks and remove temporary iptables rules")
     parser.add_argument("--replace", action="store_true", help="stop an older router_manager web process before binding")
     parser.add_argument("--admin-user", default=DEFAULT_ADMIN_USER)
+    parser.add_argument("--domain-proxy-worker", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if hasattr(args, "domain_proxy_worker"):
+        run_domain_proxy_worker(args.domain_proxy_worker)
+        return
     args.lan = args.lan or detect_lan(args.wan)
     if not args.wan or not args.lan:
         raise SystemExit("Khong detect duoc WAN/LAN interface")
