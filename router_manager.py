@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / "state"
+CONFIG_FILE = BASE_DIR / "config.json"
 STATE_FILE = STATE_DIR / "router_state.json"
 DNSMASQ_CONF = STATE_DIR / "dnsmasq.conf"
 DNSMASQ_LEASES = STATE_DIR / "dnsmasq.leases"
@@ -40,7 +41,7 @@ SESSION_FILE = STATE_DIR / "session_token.txt"
 NETWORKD_RUNTIME_DIR = Path("/run/systemd/network")
 NETWORKD_PREFIX = "00-router-manager"
 
-DEFAULT_LAN_CIDR = "10.42.0.1/24"
+DEFAULT_LAN_CIDR = "10.42.0.1/21"
 DEFAULT_BRIDGE_IF = "br-router"
 DEFAULT_WIFI_SSID = "RouterWiFi"
 DEFAULT_WIFI_CHANNEL = 6
@@ -49,6 +50,8 @@ DEFAULT_WIFI_COUNTRY = "US"
 DEFAULT_ADMIN_USER = "admin"
 PROXY_CHAIN = "ROUTER_PROXY"
 GUARD_CHAIN = "ROUTER_GUARD"
+PROXY_V4_GUARD_CHAIN = "ROUTER_PROXY_V4_GUARD"
+PROXY_V6_GUARD_CHAIN = "ROUTER_PROXY_V6_GUARD"
 PROXY_LOCAL_BASE = 23450
 PROXY_TYPES = ("http", "https", "socks5", "socks4")
 PROXY_TEST_URLS = {
@@ -222,10 +225,117 @@ def default_state():
         "proxies": [],
         "assignments": {},
         "device_names": {},
+        "device_groups": [],
         "dhcp_reservations": {},
         "lan_cidr": DEFAULT_LAN_CIDR,
         "hotspot": default_hotspot(),
     }
+
+
+def default_config():
+    return {
+        "dhcp_bindings": {},
+        "device_groups": [],
+    }
+
+
+def read_config_file_with_keys():
+    if not CONFIG_FILE.exists():
+        return default_config(), set()
+    data = json.loads(CONFIG_FILE.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("config.json phai la JSON object")
+    keys = set(data)
+    config = default_config()
+    config.update(data)
+    return config, keys
+
+
+def read_config_file():
+    config, _keys = read_config_file_with_keys()
+    return config
+
+
+def write_config_file(config):
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2))
+    tmp.replace(CONFIG_FILE)
+
+
+def config_binding_maps(config, lan_cidr):
+    bindings = config.get("dhcp_bindings", {})
+    if isinstance(bindings, list):
+        entries = ((entry.get("mac", ""), entry) for entry in bindings if isinstance(entry, dict))
+    elif isinstance(bindings, dict):
+        entries = bindings.items()
+    else:
+        entries = []
+    names = {}
+    reservations = {}
+    for raw_mac, raw_entry in entries:
+        mac = normalize_mac(raw_mac)
+        if not valid_mac(mac):
+            continue
+        entry = raw_entry if isinstance(raw_entry, dict) else {"ip_address": raw_entry}
+        name = str(entry.get("name", "")).strip()[:64]
+        if name:
+            names[mac] = name
+        raw_ip = entry.get("ip_address", entry.get("ip", entry.get("dhcp_ip", "")))
+        try:
+            ip_address = normalize_dhcp_reservation_ip(raw_ip, lan_cidr)
+        except ValueError:
+            ip_address = ""
+        if ip_address:
+            reservations[mac] = ip_address
+    return names, reservations
+
+
+def apply_config_to_state(state):
+    if not CONFIG_FILE.exists():
+        return state
+    config, config_keys = read_config_file_with_keys()
+    names, reservations = config_binding_maps(config, state.get("lan_cidr", DEFAULT_LAN_CIDR))
+    state["device_names"] = names
+    state["dhcp_reservations"] = reservations
+    if "device_groups" in config_keys:
+        state["device_groups"] = normalize_device_groups(config.get("device_groups", []))
+    else:
+        save_device_groups_config(state)
+    return state
+
+
+def save_device_groups_config(state):
+    config = read_config_file()
+    config["device_groups"] = normalize_device_groups(state.get("device_groups", []))
+    write_config_file(config)
+
+
+def save_dhcp_bindings_config(state):
+    config = read_config_file()
+    names = {normalize_mac(mac): name for mac, name in state.get("device_names", {}).items() if valid_mac(mac)}
+    reservations = {
+        normalize_mac(mac): ip_address
+        for mac, ip_address in state.get("dhcp_reservations", {}).items()
+        if valid_mac(mac)
+    }
+    bindings = {}
+    def binding_sort_key(mac):
+        try:
+            ip_key = int(ipaddress.ip_address(reservations.get(mac, "")))
+        except ValueError:
+            ip_key = 0
+        return (ip_key, names.get(mac, ""), mac)
+
+    for mac in sorted(set(names) | set(reservations), key=binding_sort_key):
+        entry = {}
+        if names.get(mac):
+            entry["name"] = str(names[mac]).strip()[:64]
+        if reservations.get(mac):
+            entry["ip_address"] = str(reservations[mac]).strip()
+        if entry:
+            bindings[mac] = entry
+    config["dhcp_bindings"] = bindings
+    write_config_file(config)
 
 
 def normalized_hotspot(state):
@@ -251,19 +361,74 @@ def normalized_hotspot(state):
     return config
 
 
+def normalize_device_group_ips(value):
+    ips = []
+    if isinstance(value, str):
+        raw_items = value.replace(",", "\n").splitlines()
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = []
+    for item in raw_items:
+        raw_ip = str(item or "").strip()
+        if not raw_ip:
+            continue
+        try:
+            ip = str(ipaddress.ip_address(raw_ip))
+        except ValueError:
+            continue
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
+
+def normalize_device_groups(raw_groups):
+    groups = []
+    seen_ids = set()
+    grouped_ips = set()
+    if not isinstance(raw_groups, list):
+        return groups
+    for item in raw_groups:
+        if not isinstance(item, dict):
+            continue
+        group_id = str(item.get("id", "")).strip()[:48]
+        if not group_id or group_id in seen_ids:
+            continue
+        ips = []
+        for ip in normalize_device_group_ips(item.get("ips", [])):
+            if ip in grouped_ips:
+                continue
+            ips.append(ip)
+            grouped_ips.add(ip)
+        if not ips:
+            continue
+        seen_ids.add(group_id)
+        groups.append(
+            {
+                "id": group_id,
+                "name": str(item.get("name", "")).strip()[:64] or "Group",
+                "ips": ips,
+                "collapsed": bool(item.get("collapsed")),
+            }
+        )
+    return groups
+
+
 def load_state():
     STATE_DIR.mkdir(exist_ok=True)
     if not STATE_FILE.exists():
-        return default_state()
+        return apply_config_to_state(default_state())
     state = json.loads(STATE_FILE.read_text())
     state.setdefault("proxies", [])
     state.setdefault("assignments", {})
     state.setdefault("device_names", {})
+    state["device_groups"] = normalize_device_groups(state.get("device_groups", []))
     state.setdefault("dhcp_reservations", {})
     state.setdefault("lan_cidr", DEFAULT_LAN_CIDR)
     state.setdefault("device_presence", {})
     state.setdefault("hidden_offline_devices", {})
     state["hotspot"] = normalized_hotspot(state)
+    apply_config_to_state(state)
     return state
 
 
@@ -281,7 +446,7 @@ def public_state(state):
 def save_state(state):
     STATE_DIR.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.write_text(json.dumps(state, indent=2))
     tmp.replace(STATE_FILE)
 
 
@@ -508,6 +673,19 @@ def prune_lan_scoped_state(state, lan_cidr):
         except ValueError:
             continue
     state["dhcp_reservations"] = reservations
+    groups = []
+    for group in normalize_device_groups(state.get("device_groups", [])):
+        ips = []
+        for client_ip in group.get("ips", []):
+            try:
+                if ipaddress.ip_address(client_ip) in lan_net:
+                    ips.append(client_ip)
+            except ValueError:
+                continue
+        if ips:
+            group["ips"] = ips
+            groups.append(group)
+    state["device_groups"] = groups
 
 
 def normalize_dhcp_reservation_ip(value, lan_cidr):
@@ -961,7 +1139,6 @@ def write_dnsmasq_conf(lan_if, lan_cidr):
                 *reservation_lines,
                 f"dhcp-leasefile={DNSMASQ_LEASES}",
                 f"pid-file={DNSMASQ_PID}",
-                "log-dhcp",
                 "",
             ]
         )
@@ -1014,20 +1191,7 @@ def remove_router_rules(wan_if, lan_if):
 def clear_lan_addresses(ifname, lan_cidr):
     if not ifname:
         return
-    lan_net = ipaddress.ip_interface(lan_cidr).network
-    rows = json.loads(sh(["ip", "-j", "addr", "show", "dev", ifname], check=False) or "[]")
-    for row in rows:
-        for info in row.get("addr_info", []):
-            if info.get("family") != "inet":
-                continue
-            local = info.get("local", "")
-            prefixlen = info.get("prefixlen")
-            try:
-                if not local or ipaddress.ip_address(local) not in lan_net:
-                    continue
-            except ValueError:
-                continue
-            sudo(["ip", "addr", "del", f"{local}/{prefixlen}", "dev", ifname], check=False)
+    sudo(["ip", "addr", "flush", "dev", ifname], check=False)
 
 
 def ensure_lan_bridge(base_lan_if, wifi_if, bridge_if, lan_cidr):
@@ -1042,8 +1206,7 @@ def ensure_lan_bridge(base_lan_if, wifi_if, bridge_if, lan_cidr):
     if not interface_exists(bridge_if):
         sudo(["ip", "link", "add", "name", bridge_if, "type", "bridge"])
     set_networkd_unmanaged([bridge_if, *lan_members, wifi_if], True)
-    sudo(["ip", "link", "set", "dev", bridge_if, "type", "bridge", "stp_state", "0"], check=False)
-    sudo(["ip", "link", "set", "dev", bridge_if, "type", "bridge", "forward_delay", "0"], check=False)
+    sudo(["ip", "link", "set", "dev", bridge_if, "type", "bridge", "stp_state", "1"], check=False)
     for member in lan_members:
         set_nm_managed(member, False)
         clear_lan_addresses(member, lan_cidr)
@@ -1110,6 +1273,11 @@ def stop_router(wan_if, lan_if, base_lan_if=""):
 
 def normalize_mac(mac):
     return str(mac or "").strip().lower()
+
+
+def valid_mac(mac):
+    parts = normalize_mac(mac).split(":")
+    return len(parts) == 6 and all(len(part) == 2 and all(ch in "0123456789abcdef" for ch in part) for part in parts)
 
 
 def remove_dnsmasq_leases_for_mac(mac):
@@ -1994,7 +2162,13 @@ def iptables_proxy_reset(lan_if):
     delete_existing_rule(["iptables", "-t", "nat", "-D", "PREROUTING", "-i", lan_if, "-p", "tcp", "-j", PROXY_CHAIN])
     sudo(["iptables", "-t", "nat", "-F", PROXY_CHAIN], check=False)
     sudo(["iptables", "-t", "nat", "-X", PROXY_CHAIN], check=False)
+    delete_existing_rule(["iptables", "-D", "FORWARD", "-i", lan_if, "-j", PROXY_V4_GUARD_CHAIN])
+    sudo(["iptables", "-F", PROXY_V4_GUARD_CHAIN], check=False)
+    sudo(["iptables", "-X", PROXY_V4_GUARD_CHAIN], check=False)
     delete_existing_rule(["ip6tables", "-D", "FORWARD", "-i", lan_if, "-j", "REJECT"])
+    delete_existing_rule(["ip6tables", "-D", "FORWARD", "-i", lan_if, "-j", PROXY_V6_GUARD_CHAIN])
+    sudo(["ip6tables", "-F", PROXY_V6_GUARD_CHAIN], check=False)
+    sudo(["ip6tables", "-X", PROXY_V6_GUARD_CHAIN], check=False)
     state = load_state()
     for client_ip in list(state.get("assignments", {}).keys()) + list_client_ips(lan_if, state.get("lan_cidr", DEFAULT_LAN_CIDR)):
         delete_existing_rule(
@@ -2112,6 +2286,51 @@ def list_client_ips(lan_if, lan_cidr):
     return sorted(clients)
 
 
+def client_mac_map(lan_if, lan_cidr, state=None):
+    lan_net = ipaddress.ip_interface(lan_cidr).network
+    mapping = {}
+
+    def add(ip, mac):
+        ip = str(ip or "").strip()
+        mac = normalize_mac(mac)
+        if not valid_mac(mac):
+            return
+        try:
+            if ipaddress.ip_address(ip) not in lan_net:
+                return
+        except ValueError:
+            return
+        mapping[ip] = mac
+
+    if DNSMASQ_LEASES.exists():
+        for line in DNSMASQ_LEASES.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                add(parts[2], parts[1])
+
+    neigh = sh(["ip", "-j", "neigh"], check=False)
+    try:
+        rows = json.loads(neigh or "[]")
+    except json.JSONDecodeError:
+        rows = []
+    for row in rows:
+        ip = row.get("dst", "")
+        if row.get("dev") == lan_if and ip and ":" not in ip:
+            add(ip, row.get("lladdr", ""))
+
+    state = state or {}
+    for mac, ip in state.get("dhcp_reservations", {}).items():
+        if str(ip or "").strip() not in mapping:
+            add(ip, mac)
+    for entry in state.get("device_presence", {}).values():
+        if isinstance(entry, dict):
+            ip = str(entry.get("ip", "")).strip()
+            if ip not in mapping:
+                add(ip, entry.get("mac", ""))
+
+    return {ip: mac for ip, mac in mapping.items() if valid_mac(mac)}
+
+
 def ip_sort_key(value):
     return tuple(int(part) for part in value.split("."))
 
@@ -2198,6 +2417,7 @@ def apply_proxy_rules(lan_if):
     assignments = state.get("assignments", {})
     lan_cidr = state.get("lan_cidr", DEFAULT_LAN_CIDR)
     client_ips = set(assignments.keys()) | set(list_client_ips(lan_if, lan_cidr))
+    mac_by_ip = client_mac_map(lan_if, lan_cidr, state)
     lan_ip, _, _ = cidr_parts(lan_cidr)
     wan_ip = ""
     addr_rows = json.loads(sh(["ip", "-j", "addr"], check=False) or "[]")
@@ -2218,9 +2438,12 @@ def apply_proxy_rules(lan_if):
         return
     start_redsocks(proxies, lan_ip)
     start_domain_proxy_workers(proxies, lan_ip)
-    sudo(["ip6tables", "-I", "FORWARD", "1", "-i", lan_if, "-j", "REJECT"], check=False)
     sudo(["iptables", "-t", "nat", "-N", PROXY_CHAIN], check=False)
     sudo(["iptables", "-t", "nat", "-F", PROXY_CHAIN])
+    sudo(["iptables", "-N", PROXY_V4_GUARD_CHAIN], check=False)
+    sudo(["iptables", "-F", PROXY_V4_GUARD_CHAIN])
+    sudo(["ip6tables", "-N", PROXY_V6_GUARD_CHAIN], check=False)
+    sudo(["ip6tables", "-F", PROXY_V6_GUARD_CHAIN], check=False)
     for net in PRIVATE_NETS:
         sudo(["iptables", "-t", "nat", "-A", PROXY_CHAIN, "-d", net, "-j", "RETURN"])
     for local_target in filter(None, [lan_ip, wan_ip]):
@@ -2236,6 +2459,7 @@ def apply_proxy_rules(lan_if):
         except ValueError:
             continue
         proxy = proxies[idx]
+        proxy_version = proxy_ip_version(proxy)
         # Let explicit connections to the upstream proxy pass, avoiding accidental loops.
         if not is_ipv6_literal(proxy["host"]):
             sudo(
@@ -2257,6 +2481,37 @@ def apply_proxy_rules(lan_if):
                     "RETURN",
                 ]
             )
+        if proxy_version == "6":
+            sudo(
+                [
+                    "iptables",
+                    "-A",
+                    PROXY_V4_GUARD_CHAIN,
+                    "-s",
+                    client_ip,
+                    "-j",
+                    "REJECT",
+                    "--reject-with",
+                    "icmp-port-unreachable",
+                ]
+            )
+        else:
+            client_mac = mac_by_ip.get(client_ip, "")
+            if client_mac:
+                sudo(
+                    [
+                        "ip6tables",
+                        "-A",
+                        PROXY_V6_GUARD_CHAIN,
+                        "-m",
+                        "mac",
+                        "--mac-source",
+                        client_mac,
+                        "-j",
+                        "REJECT",
+                    ],
+                    check=False,
+                )
         delete_existing_rule(
             [
                 "iptables",
@@ -2312,6 +2567,10 @@ def apply_proxy_rules(lan_if):
         )
     sudo(["iptables", "-t", "nat", "-A", PROXY_CHAIN, "-j", "RETURN"])
     sudo(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", lan_if, "-p", "tcp", "-j", PROXY_CHAIN])
+    sudo(["iptables", "-A", PROXY_V4_GUARD_CHAIN, "-j", "RETURN"])
+    sudo(["iptables", "-I", "FORWARD", "1", "-i", lan_if, "-j", PROXY_V4_GUARD_CHAIN])
+    sudo(["ip6tables", "-A", PROXY_V6_GUARD_CHAIN, "-j", "RETURN"], check=False)
+    sudo(["ip6tables", "-I", "FORWARD", "1", "-i", lan_if, "-j", PROXY_V6_GUARD_CHAIN], check=False)
     flush_client_conntrack(client_ips)
 
 
@@ -2385,6 +2644,7 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
     proxies = state.get("proxies", [])
     assignments = state.get("assignments", {})
     device_names = state.get("device_names", {})
+    device_groups = normalize_device_groups(state.get("device_groups", []))
     dhcp_reservations = state.get("dhcp_reservations", {})
     lan_cidr = state.get("lan_cidr", DEFAULT_LAN_CIDR)
     device_presence = state.get("device_presence", {})
@@ -2424,7 +2684,18 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
     leases = [leases[ip] for ip in sorted(leases, key=lambda value: tuple(int(p) for p in value.split(".")))]
     online_count = sum(1 for lease in leases if lease.get("online"))
     offline_count = len(leases) - online_count
-    device_filter = device_filter if device_filter in {"online", "offline"} else "online"
+    interface_counts = {}
+    for lease in leases:
+        ifname = str(lease.get("interface", "")).strip()
+        if ifname:
+            interface_counts[ifname] = interface_counts.get(ifname, 0) + 1
+    card_order = {card.get("name", ""): idx for idx, card in enumerate(data.get("network_cards", []))}
+    device_interface_tabs = sorted(
+        interface_counts,
+        key=lambda name: (card_order.get(name, len(card_order)), name),
+    )
+    valid_device_filters = {"all", "online", "offline"} | {f"if:{name}" for name in device_interface_tabs}
+    device_filter = device_filter if device_filter in valid_device_filters else "online"
     sort_columns = {
         "ip": "IP",
         "name": "Name",
@@ -2484,29 +2755,58 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
             return assigned_proxy_label(lease)
         return ip_sort_value(lease.get("ip", ""))
 
-    filtered_leases = [
-        lease
-        for lease in leases
-        if bool(lease.get("online")) == (device_filter == "online")
-    ]
+    if device_filter == "all":
+        filtered_leases = list(leases)
+    elif device_filter in {"online", "offline"}:
+        filtered_leases = [
+            lease
+            for lease in leases
+            if bool(lease.get("online")) == (device_filter == "online")
+        ]
+    elif device_filter.startswith("if:"):
+        filter_ifname = device_filter[3:]
+        filtered_leases = [lease for lease in leases if str(lease.get("interface", "")).strip() == filter_ifname]
+    else:
+        filtered_leases = []
     filtered_leases = sorted(
         filtered_leases,
         key=lambda lease: (device_sort_value(lease), ip_sort_value(lease.get("ip", ""))),
         reverse=sort_dir == "desc",
     )
-    device_empty_text = (
-        "Chua co thiet bi online."
-        if device_filter == "online"
-        else "Chua co thiet bi offline."
-    )
+    if device_filter == "all":
+        device_empty_text = "Chua co thiet bi."
+    elif device_filter == "online":
+        device_empty_text = "Chua co thiet bi online."
+    elif device_filter == "offline":
+        device_empty_text = "Chua co thiet bi offline."
+    elif device_filter.startswith("if:"):
+        device_empty_text = f"Chua co thiet bi tren {device_filter[3:]}."
+    else:
+        device_empty_text = "Chua co thiet bi."
     tab_sort_query = f"&sort={quote(device_sort)}&dir={quote(sort_dir)}"
+
+    def device_tab(key, label, count):
+        active_class = "active" if device_filter == key else ""
+        return (
+            f'<a data-device-nav="1" class="{active_class}" href="/?devices={quote(key)}{tab_sort_query}">'
+            f'{html.escape(label)} <span>{count}</span></a>'
+        )
+
+    device_tab_items = [
+        device_tab("all", "All", len(leases)),
+        device_tab("online", "Online", online_count),
+        device_tab("offline", "Offline", offline_count),
+    ]
+    for ifname in device_interface_tabs:
+        device_tab_items.append(device_tab(f"if:{ifname}", ifname, interface_counts[ifname]))
     device_tabs = f"""
         <div class="device-tabs">
-          <a data-device-nav="1" class="{ 'active' if device_filter == 'online' else '' }" href="/?devices=online{tab_sort_query}">Online <span>{online_count}</span></a>
-          <a data-device-nav="1" class="{ 'active' if device_filter == 'offline' else '' }" href="/?devices=offline{tab_sort_query}">Offline <span>{offline_count}</span></a>
+          {''.join(device_tab_items)}
         </div>
     """
-    device_headers = []
+    device_headers = [
+        '<th class="select-col"><input type="checkbox" data-device-checkall aria-label="Select all devices"></th>'
+    ]
     for key, label in sort_columns.items():
         next_dir = "desc" if device_sort == key and sort_dir == "asc" else "asc"
         marker = "^" if device_sort == key and sort_dir == "asc" else ("v" if device_sort == key else "")
@@ -2536,8 +2836,7 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
         proxy_options.append(
             f"<option value='{idx}'>{html.escape(proxy_key(proxy))} -> localhost:{proxy_port(idx)}</option>"
         )
-    device_rows = []
-    for lease in filtered_leases:
+    def render_device_row(lease, group_id="", collapsed=False):
         ip = lease["ip"]
         current = assignments.get(ip, "")
         options = []
@@ -2561,12 +2860,26 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
         status_time_label = "Last seen" if online else "Disconnected"
         status_detail = " ".join(filter(None, [status_time_label if status_time else "", status_time]))
         status_reason = lease.get("presence_reason", "")
-        device_rows.append(
+        row_attrs = ' class="device-row"'
+        if group_id:
+            row_attrs += f' data-group-member="{html.escape(group_id)}"'
+        if collapsed:
+            row_attrs += " hidden"
+        return (
             f"""
-	            <tr>
-	              <td><strong>{html.escape(ip)}</strong><span>{html.escape(lease.get('source',''))}</span></td>
-	              <td><strong>{html.escape(name_display)}</strong>{f'<span>DHCP {html.escape(dhcp_ip)}</span>' if dhcp_ip else ''}</td>
-	              <td>{html.escape(lease.get('mac',''))}</td>
+			            <tr{row_attrs}>
+			              <td class="select-col">
+			                <input
+		                  type="checkbox"
+		                  data-device-select
+		                  data-ip="{html.escape(ip)}"
+		                  data-mac="{html.escape(mac)}"
+		                  aria-label="Select {html.escape(ip)}"
+		                >
+		              </td>
+		              <td><strong>{html.escape(ip)}</strong><span>{html.escape(lease.get('source',''))}</span></td>
+		              <td><strong>{html.escape(name_display)}</strong>{f'<span>DHCP {html.escape(dhcp_ip)}</span>' if dhcp_ip else ''}</td>
+		              <td>{html.escape(lease.get('mac',''))}</td>
               <td>{html.escape(lease.get('hostname',''))}</td>
               <td><strong>{html.escape(lease.get('connection','Unknown'))}</strong><span>{html.escape(connection_detail)}</span></td>
               <td>
@@ -2593,9 +2906,49 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
 	                  {'disabled' if not mac else ''}
 	                >Edit</button>
 	              </td>
-	            </tr>
+		            </tr>
+	            """
+        )
+
+    row_by_ip = {lease["ip"]: render_device_row(lease) for lease in filtered_leases}
+    lease_by_ip = {lease["ip"]: lease for lease in filtered_leases}
+    device_rows = []
+    grouped_visible_ips = set()
+    for group in device_groups:
+        group_id = group["id"]
+        group_ips = [ip for ip in group.get("ips", []) if ip in row_by_ip]
+        if not group_ips:
+            continue
+        grouped_visible_ips.update(group_ips)
+        online_in_group = sum(1 for ip in group_ips if lease_by_ip[ip].get("online"))
+        collapsed = bool(group.get("collapsed"))
+        expanded = "false" if collapsed else "true"
+        toggle_label = "Mo" if collapsed else "Thu gon"
+        device_word = "device" if len(group_ips) == 1 else "devices"
+        device_rows.append(
+            f"""
+            <tr class="device-group-row" data-device-group="{html.escape(group_id)}" data-collapsed="{'1' if collapsed else '0'}">
+              <td colspan="9">
+                <div class="device-group-head">
+                  <button type="button" class="group-toggle" data-group-toggle data-group-id="{html.escape(group_id)}" aria-expanded="{expanded}">{html.escape(toggle_label)}</button>
+                  <div class="device-group-title">
+                    <strong>{html.escape(group.get('name', 'Group'))}</strong>
+                    <span>{len(group_ips)} {device_word} | {online_in_group} online</span>
+                  </div>
+                  <form method="post" action="/device-group/delete">
+                    <input type="hidden" name="id" value="{html.escape(group_id)}">
+                    <button type="submit" class="neutral group-delete">Bo group</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
             """
         )
+        for ip in group_ips:
+            device_rows.append(render_device_row(lease_by_ip[ip], group_id, collapsed))
+    for lease in filtered_leases:
+        if lease["ip"] not in grouped_visible_ips:
+            device_rows.append(row_by_ip[lease["ip"]])
     proxy_rows = []
     load_counts = proxy_load_counts(assignments, range(len(proxies)))
     for idx, proxy in enumerate(proxies):
@@ -2698,13 +3051,15 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
     .metric {{ border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 74px; }}
     .metric b {{ display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
     .ok {{ color: var(--accent); font-weight: 700; }}
-    .bad {{ color: var(--danger); font-weight: 700; }}
-    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }}
-    th {{ color: var(--muted); font-size: 13px; font-weight: 700; }}
-    td span {{ display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }}
-    .status-badge {{
+	    .bad {{ color: var(--danger); font-weight: 700; }}
+	    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+	    table {{ width: 100%; border-collapse: collapse; }}
+	    th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }}
+	    th {{ color: var(--muted); font-size: 13px; font-weight: 700; }}
+	    td span {{ display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }}
+	    .select-col {{ width: 34px; min-width: 34px; text-align: center; }}
+	    .select-col input {{ width: 18px; height: 18px; min-height: 18px; padding: 0; accent-color: var(--accent-2); cursor: pointer; }}
+	    .status-badge {{
       display: inline-flex;
       align-items: center;
       gap: 7px;
@@ -2727,6 +3082,7 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
 	    .device-tabs {{
 	      display: inline-flex;
 	      align-items: center;
+	      flex-wrap: wrap;
 	      gap: 4px;
 	      padding: 4px;
 	      margin-bottom: 12px;
@@ -2749,13 +3105,104 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
 	      color: white;
 	      background: var(--accent);
 	    }}
-	    .device-tabs span {{
-	      margin: 0;
-	      color: inherit;
-	      font-size: 12px;
-	      font-weight: 800;
-	    }}
-	    .sort-link {{
+		    .device-tabs span {{
+		      margin: 0;
+		      color: inherit;
+		      font-size: 12px;
+		      font-weight: 800;
+		    }}
+		    .device-toolbar {{
+		      display: flex;
+		      align-items: center;
+		      justify-content: space-between;
+		      gap: 12px;
+		      flex-wrap: wrap;
+		      margin-bottom: 12px;
+		    }}
+		    .device-toolbar .device-tabs {{
+		      margin-bottom: 0;
+		    }}
+			    .bulk-copy {{
+			      position: relative;
+			      display: inline-flex;
+			      align-items: center;
+			      gap: 8px;
+			      flex-wrap: wrap;
+			    }}
+			    .bulk-copy[hidden] {{
+			      display: none;
+			    }}
+			    .group-action {{
+			      background: var(--accent);
+			    }}
+			    .device-group-row td {{
+			      padding: 10px 8px;
+			      background: #f8fafc;
+			    }}
+			    .device-group-head {{
+			      display: flex;
+			      align-items: center;
+			      justify-content: space-between;
+			      gap: 12px;
+			      min-height: 46px;
+			      padding: 6px 8px;
+			      border: 1px solid var(--line);
+			      border-radius: 8px;
+			      background: linear-gradient(180deg, #ffffff 0%, #f4f7fb 100%);
+			    }}
+			    .device-group-title {{
+			      flex: 1;
+			      min-width: 160px;
+			    }}
+			    .device-group-title strong {{
+			      display: block;
+			      font-size: 15px;
+			    }}
+			    .device-group-title span {{
+			      margin-top: 3px;
+			    }}
+			    .group-toggle {{
+			      min-width: 78px;
+			      background: #0f766e;
+			    }}
+			    .group-delete {{
+			      min-width: 82px;
+			    }}
+			    .group-modal-count {{
+			      color: var(--muted);
+			      font-size: 12px;
+			      font-weight: 800;
+			    }}
+			    .bulk-copy-menu {{
+		      position: absolute;
+		      top: calc(100% + 6px);
+		      right: 0;
+		      z-index: 10;
+		      min-width: 138px;
+		      display: grid;
+		      gap: 4px;
+		      padding: 6px;
+		      border: 1px solid var(--line);
+		      border-radius: 8px;
+		      background: var(--panel);
+		      box-shadow: 0 12px 32px rgba(15, 23, 42, 0.16);
+		    }}
+		    .bulk-copy-menu[hidden] {{
+		      display: none;
+		    }}
+		    .bulk-copy-menu button {{
+		      justify-content: flex-start;
+		      min-height: 34px;
+		      width: 100%;
+		      border-radius: 6px;
+		      background: transparent;
+		      color: var(--ink);
+		      text-align: left;
+		    }}
+		    .bulk-copy-menu button:hover {{
+		      background: var(--soft);
+		    }}
+		    .sort-link {{
 	      display: inline-flex;
 	      align-items: center;
 	      gap: 6px;
@@ -2869,17 +3316,19 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
       max-height: 240px;
     }}
     .msg {{ padding: 10px 12px; border-radius: 8px; background: #e0f2fe; border: 1px solid #bae6fd; }}
-    @media (max-width: 720px) {{
-      header {{ padding: 18px; }}
-      header {{ display: block; }}
-      main {{ padding: 14px; }}
-      table, thead, tbody, th, td, tr {{ display: block; }}
-      thead {{ display: none; }}
-      tr {{ border-bottom: 1px solid var(--line); padding: 8px 0; }}
-      td {{ border-bottom: 0; padding: 6px 0; }}
-      form {{ align-items: stretch; }}
-      select, button, input {{ width: 100%; }}
-      .proxy-form {{ grid-template-columns: 1fr; }}
+	    @media (max-width: 720px) {{
+	      header {{ padding: 18px; }}
+	      header {{ display: block; }}
+	      main {{ padding: 14px; }}
+	      table, thead, tbody, th, td, tr {{ display: block; }}
+	      thead {{ display: none; }}
+	      tr {{ border-bottom: 1px solid var(--line); padding: 8px 0; }}
+	      td {{ border-bottom: 0; padding: 6px 0; }}
+	      td.select-col {{ width: auto; min-width: 0; text-align: left; padding-bottom: 2px; }}
+	      td.select-col input {{ width: 18px; }}
+	      form {{ align-items: stretch; }}
+	      select, button, input {{ width: 100%; }}
+	      .proxy-form {{ grid-template-columns: 1fr; }}
       .hotspot-form {{ grid-template-columns: 1fr; }}
     }}
   </style>
@@ -2975,13 +3424,23 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
         <tbody>{''.join(card_rows) if card_rows else '<tr><td colspan="5">Khong doc duoc card mang.</td></tr>'}</tbody>
       </table>
     </section>
-	    <section>
-	      <h2>Devices</h2>
-	      {device_tabs}
-	      <table>
-	        <thead><tr>{''.join(device_headers)}</tr></thead>
-	        <tbody>{''.join(device_rows) if device_rows else f'<tr><td colspan="8">{device_empty_text}</td></tr>'}</tbody>
-	      </table>
+		    <section>
+		      <h2>Devices</h2>
+			      <div class="device-toolbar">
+			        {device_tabs}
+			        <div class="bulk-copy" data-bulk-copy hidden>
+			          <button type="button" class="group-action" data-group-create-open>Tao group</button>
+			          <button type="button" class="neutral" data-copy-toggle>Copy</button>
+			          <div class="bulk-copy-menu" data-copy-menu hidden>
+		            <button type="button" data-copy-selected="dhcp">Copy DHCP</button>
+		            <button type="button" data-copy-selected="mac">Copy MAC</button>
+		          </div>
+		        </div>
+		      </div>
+		      <table>
+		        <thead><tr>{''.join(device_headers)}</tr></thead>
+		        <tbody>{''.join(device_rows) if device_rows else f'<tr><td colspan="9">{device_empty_text}</td></tr>'}</tbody>
+		      </table>
 		      <form method="post" action="/assign" style="margin-top:14px">
 		        <input type="text" name="ip" placeholder="Gan thu cong IP, vi du 10.42.0.50">
 		        <select name="proxy">{''.join(assign_options)}</select>
@@ -3067,8 +3526,24 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
 	      <pre>{html.escape(data['interfaces'])}</pre>
 	      <pre>{html.escape(data['routes'])}</pre>
 	    </section>
-	  </main>
-	  <div class="modal" data-device-modal hidden>
+		  </main>
+		  <div class="modal" data-group-modal hidden>
+		    <div class="modal-panel">
+		      <h3>Tao Device Group</h3>
+		      <form method="post" action="/device-group/create" data-group-form>
+		        <input type="hidden" name="ips" data-group-ips>
+		        <label>Ten group
+		          <input type="text" name="name" maxlength="64" data-group-name placeholder="Vi du: Samsung Box">
+		        </label>
+			        <div class="group-modal-count" data-group-count>0 devices da chon</div>
+			        <div class="modal-actions">
+			          <button type="button" class="neutral" data-group-modal-close>Huy</button>
+			          <button class="primary">Tao</button>
+		        </div>
+		      </form>
+		    </div>
+		  </div>
+		  <div class="modal" data-device-modal hidden>
 	    <div class="modal-panel">
 	      <h3>DHCP Binding</h3>
 	      <form method="post" action="/device/edit">
@@ -3091,17 +3566,72 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
 	  </div>
 	  <script>
 	    (() => {{
-	      let socket = null;
-	      let retryTimer = null;
-	      let pendingHtml = null;
-		      let state = new URLSearchParams(window.location.search);
-		      const socketStatus = () => document.querySelector('[data-socket-status]');
-		      const hasFocusedEditor = () => Boolean(document.querySelector('input:focus, select:focus, textarea:focus'));
-	      const deviceModal = () => document.querySelector('[data-device-modal]');
-	      const closeDeviceModal = () => {{
-	        const modal = deviceModal();
-	        if (modal) modal.hidden = true;
-	      }};
+		      let socket = null;
+		      let retryTimer = null;
+		      let pendingHtml = null;
+		      let selectedDeviceIps = new Set();
+			      let state = new URLSearchParams(window.location.search);
+			      const socketStatus = () => document.querySelector('[data-socket-status]');
+			      const hasFocusedEditor = () => Boolean(document.querySelector('input:focus, select:focus, textarea:focus'));
+		      const deviceBoxes = () => Array.from(document.querySelectorAll('[data-device-select]'));
+		      const selectedDeviceBoxes = () => deviceBoxes().filter((box) => box.checked);
+			      const copyMenu = () => document.querySelector('[data-copy-menu]');
+			      const deviceModal = () => document.querySelector('[data-device-modal]');
+			      const groupModal = () => document.querySelector('[data-group-modal]');
+		      const updateBulkCopy = () => {{
+		        const boxes = deviceBoxes();
+		        const selected = selectedDeviceBoxes();
+		        const checkAll = document.querySelector('[data-device-checkall]');
+		        if (checkAll) {{
+		          checkAll.checked = boxes.length > 0 && selected.length === boxes.length;
+		          checkAll.indeterminate = selected.length > 0 && selected.length < boxes.length;
+		        }}
+		        const bulk = document.querySelector('[data-bulk-copy]');
+		        if (bulk) bulk.hidden = selected.length === 0;
+		        const toggle = document.querySelector('[data-copy-toggle]');
+		        if (toggle) toggle.textContent = selected.length ? 'Copy (' + selected.length + ')' : 'Copy';
+		        if (!selected.length && copyMenu()) copyMenu().hidden = true;
+		      }};
+		      const restoreBulkSelection = () => {{
+		        deviceBoxes().forEach((box) => {{
+		          box.checked = selectedDeviceIps.has(box.dataset.ip || '');
+		        }});
+		        updateBulkCopy();
+		      }};
+		      const copyText = async (text) => {{
+		        if (navigator.clipboard && window.isSecureContext) {{
+		          await navigator.clipboard.writeText(text);
+		          return;
+		        }}
+		        const area = document.createElement('textarea');
+		        area.value = text;
+		        area.setAttribute('readonly', '');
+		        area.style.position = 'fixed';
+		        area.style.left = '-9999px';
+		        document.body.appendChild(area);
+		        area.select();
+		        document.execCommand('copy');
+		        area.remove();
+		      }};
+		      const copySelectedDevices = async (mode) => {{
+		        const values = selectedDeviceBoxes()
+		          .map((box) => mode === 'mac' ? box.dataset.mac || '' : box.dataset.ip || '')
+		          .filter(Boolean);
+		        if (!values.length) return;
+		        await copyText(values.join('\\n'));
+		        const menu = copyMenu();
+		        if (menu) menu.hidden = true;
+		        const toggle = document.querySelector('[data-copy-toggle]');
+		        if (toggle) {{
+		          const original = toggle.textContent;
+		          toggle.textContent = 'Copied';
+		          setTimeout(updateBulkCopy, 900);
+		        }}
+		      }};
+			      const closeDeviceModal = () => {{
+			        const modal = deviceModal();
+			        if (modal) modal.hidden = true;
+		      }};
 	      const openDeviceModal = (button) => {{
 	        const modal = deviceModal();
 		        if (!modal) return;
@@ -3109,13 +3639,45 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
 		        modal.querySelector('[data-modal-mac]').value = button.dataset.mac || '';
 		        modal.querySelector('[data-modal-name]').value = button.dataset.name || '';
 		        modal.querySelector('[data-modal-ip-address]').value = button.dataset.bindingIp || button.dataset.ip || '';
+			        modal.hidden = false;
+			        modal.querySelector('[data-modal-name]').focus();
+		      }};
+		      const selectedGroupIps = () => selectedDeviceBoxes()
+		        .map((box) => box.dataset.ip || '')
+		        .filter(Boolean);
+		      const closeGroupModal = () => {{
+		        const modal = groupModal();
+		        if (modal) modal.hidden = true;
+		      }};
+		      const openGroupModal = () => {{
+		        const ips = selectedGroupIps();
+		        if (!ips.length) return;
+		        const modal = groupModal();
+		        if (!modal) return;
+		        modal.querySelector('[data-group-ips]').value = ips.join('\\n');
+		        modal.querySelector('[data-group-count]').textContent = ips.length + (ips.length === 1 ? ' device da chon' : ' devices da chon');
 		        modal.hidden = false;
-		        modal.querySelector('[data-modal-name]').focus();
-	      }};
-		      const applyDashboard = (html) => {{
-		        const main = document.querySelector('main');
-		        if (main) main.outerHTML = html;
-	      }};
+		        modal.querySelector('[data-group-name]').focus();
+		      }};
+			      const setGroupCollapsed = (groupId, collapsed) => {{
+			        const groupRow = Array.from(document.querySelectorAll('[data-device-group]')).find((row) => row.dataset.deviceGroup === groupId);
+			        if (groupRow) groupRow.dataset.collapsed = collapsed ? '1' : '0';
+			        Array.from(document.querySelectorAll('[data-group-member]')).filter((row) => row.dataset.groupMember === groupId).forEach((row) => {{
+			          row.hidden = collapsed;
+			        }});
+			        const toggle = Array.from(document.querySelectorAll('[data-group-toggle]')).find((button) => button.dataset.groupId === groupId);
+		        if (toggle) {{
+		          toggle.textContent = collapsed ? 'Mo' : 'Thu gon';
+		          toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+		        }}
+		      }};
+				      const applyDashboard = (html) => {{
+				        const main = document.querySelector('main');
+				        if (main) {{
+			          main.outerHTML = html;
+			          restoreBulkSelection();
+			        }}
+		      }};
 	      const filters = () => ({{
 	        devices: state.get('devices') || 'online',
 	        sort: state.get('sort') || 'ip',
@@ -3177,29 +3739,108 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
 		          sendFilters(true);
 		          return;
 		        }}
-		        const edit = event.target.closest('[data-device-edit]');
-		        if (edit) {{
-		          event.preventDefault();
-		          openDeviceModal(edit);
-		          return;
-		        }}
-		        const close = event.target.closest('[data-modal-close]');
-		        if (close) {{
-		          event.preventDefault();
+			        const edit = event.target.closest('[data-device-edit]');
+			        if (edit) {{
+			          event.preventDefault();
+			          openDeviceModal(edit);
+			          return;
+			        }}
+				        const copyToggle = event.target.closest('[data-copy-toggle]');
+				        if (copyToggle) {{
+			          event.preventDefault();
+			          const menu = copyMenu();
+			          if (menu) menu.hidden = !menu.hidden;
+			          return;
+			        }}
+			        const copyOption = event.target.closest('[data-copy-selected]');
+			        if (copyOption) {{
+			          event.preventDefault();
+			          copySelectedDevices(copyOption.dataset.copySelected || 'dhcp');
+				          return;
+				        }}
+				        const groupOpen = event.target.closest('[data-group-create-open]');
+				        if (groupOpen) {{
+				          event.preventDefault();
+				          openGroupModal();
+				          return;
+				        }}
+				        const groupToggle = event.target.closest('[data-group-toggle]');
+				        if (groupToggle) {{
+				          event.preventDefault();
+				          const groupId = groupToggle.dataset.groupId || '';
+				          const groupRow = Array.from(document.querySelectorAll('[data-device-group]')).find((row) => row.dataset.deviceGroup === groupId);
+				          const collapsed = !(groupRow && groupRow.dataset.collapsed === '1');
+				          setGroupCollapsed(groupId, collapsed);
+				          const params = new URLSearchParams({{id: groupId, collapsed: collapsed ? '1' : '0'}});
+				          fetch('/device-group/toggle', {{
+				            method: 'POST',
+				            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+				            body: params.toString(),
+				          }}).catch(() => {{}});
+				          return;
+				        }}
+				        const close = event.target.closest('[data-modal-close]');
+				        if (close) {{
+			          event.preventDefault();
 		          closeDeviceModal();
 		          return;
 		        }}
-		        const modal = event.target.closest('[data-device-modal]');
-		        if (modal && event.target === modal) {{
-		          closeDeviceModal();
-		          return;
-		        }}
+			        const modal = event.target.closest('[data-device-modal]');
+			        if (modal && event.target === modal) {{
+			          closeDeviceModal();
+			          return;
+			        }}
+			        const groupClose = event.target.closest('[data-group-modal-close]');
+			        if (groupClose) {{
+			          event.preventDefault();
+			          closeGroupModal();
+			          return;
+			        }}
+			        const groupBackdrop = event.target.closest('[data-group-modal]');
+			        if (groupBackdrop && event.target === groupBackdrop) {{
+			          closeGroupModal();
+			          return;
+			        }}
 		        const refresh = event.target.closest('[data-refresh-status]');
-		        if (refresh) {{
-		          event.preventDefault();
-	          sendFilters(true);
-	        }}
-	      }});
+			        if (refresh) {{
+			          event.preventDefault();
+		          sendFilters(true);
+		        }}
+		        if (!event.target.closest('[data-bulk-copy]') && copyMenu()) {{
+		          copyMenu().hidden = true;
+				        }}
+				      }});
+				      document.addEventListener('submit', (event) => {{
+				        const groupForm = event.target.closest('[data-group-form]');
+				        if (!groupForm) return;
+				        const ips = selectedGroupIps();
+				        if (!ips.length) {{
+				          event.preventDefault();
+				          closeGroupModal();
+				          return;
+				        }}
+				        groupForm.querySelector('[data-group-ips]').value = ips.join('\\n');
+				      }});
+				      document.addEventListener('change', (event) => {{
+		        const checkAll = event.target.closest('[data-device-checkall]');
+		        if (checkAll) {{
+		          deviceBoxes().forEach((box) => {{
+		            box.checked = checkAll.checked;
+		            if (box.dataset.ip) {{
+		              if (box.checked) selectedDeviceIps.add(box.dataset.ip);
+		              else selectedDeviceIps.delete(box.dataset.ip);
+			        }}
+			      }});
+			          updateBulkCopy();
+		          return;
+		        }}
+		        const box = event.target.closest('[data-device-select]');
+		        if (box) {{
+		          if (box.checked) selectedDeviceIps.add(box.dataset.ip || '');
+		          else selectedDeviceIps.delete(box.dataset.ip || '');
+		          updateBulkCopy();
+		        }}
+		      }});
 		      document.addEventListener('focusout', () => {{
 	        setTimeout(() => {{
 	          if (!pendingHtml || hasFocusedEditor()) return;
@@ -3208,9 +3849,12 @@ def render_page(data, message="", proxy_check=None, device_filter="online", devi
 	          applyDashboard(html);
 	        }}, 0);
 		      }});
-	      document.addEventListener('keydown', (event) => {{
-	        if (event.key === 'Escape') closeDeviceModal();
-	      }});
+		      document.addEventListener('keydown', (event) => {{
+		        if (event.key === 'Escape') {{
+		          closeDeviceModal();
+		          closeGroupModal();
+		        }}
+		      }});
 	      window.addEventListener('beforeunload', () => {{
 	        if (socket) socket.close();
 	      }});
@@ -3645,6 +4289,62 @@ class Handler(BaseHTTPRequestHandler):
                 apply_proxy_rules(self.current_lan_if())
                 self.redirect("Assignment saved")
                 return
+            if self.path == "/device-group/create":
+                data = self.form()
+                name = str(data.get("name", "")).strip()[:64]
+                ips = normalize_device_group_ips(data.get("ips", ""))
+                if not name:
+                    raise ValueError("Ten group khong duoc de trong")
+                if not ips:
+                    raise ValueError("Chua chon device de tao group")
+                state = load_state()
+                groups = []
+                selected = set(ips)
+                for group in normalize_device_groups(state.get("device_groups", [])):
+                    group["ips"] = [ip for ip in group.get("ips", []) if ip not in selected]
+                    if group["ips"]:
+                        groups.append(group)
+                groups.append(
+                    {
+                        "id": f"group-{timestamp_now()}-{secrets.token_hex(4)}",
+                        "name": name,
+                        "ips": ips,
+                        "collapsed": False,
+                    }
+                )
+                state["device_groups"] = groups
+                save_device_groups_config(state)
+                save_state(state)
+                self.redirect(f"Group created: {name}")
+                return
+            if self.path == "/device-group/toggle":
+                data = self.form()
+                group_id = str(data.get("id", "")).strip()
+                collapsed = str(data.get("collapsed", "")) == "1"
+                state = load_state()
+                groups = normalize_device_groups(state.get("device_groups", []))
+                for group in groups:
+                    if group.get("id") == group_id:
+                        group["collapsed"] = collapsed
+                        break
+                state["device_groups"] = groups
+                save_device_groups_config(state)
+                save_state(state)
+                self.respond("ok", content_type="text/plain; charset=utf-8")
+                return
+            if self.path == "/device-group/delete":
+                data = self.form()
+                group_id = str(data.get("id", "")).strip()
+                state = load_state()
+                state["device_groups"] = [
+                    group
+                    for group in normalize_device_groups(state.get("device_groups", []))
+                    if group.get("id") != group_id
+                ]
+                save_device_groups_config(state)
+                save_state(state)
+                self.redirect("Group removed")
+                return
             if self.path == "/device/name":
                 data = self.form()
                 mac = normalize_mac(data.get("mac", ""))
@@ -3657,6 +4357,7 @@ class Handler(BaseHTTPRequestHandler):
                     names[mac] = name
                 else:
                     names.pop(mac, None)
+                save_dhcp_bindings_config(state)
                 save_state(state)
                 self.redirect("Device name saved")
                 return
@@ -3690,6 +4391,7 @@ class Handler(BaseHTTPRequestHandler):
                     names.pop(mac, None)
                 if reservation_changed:
                     removed_lease_ips = remove_dnsmasq_leases_for_mac(mac)
+                save_dhcp_bindings_config(state)
                 save_state(state)
                 lan_if = self.current_lan_if()
                 start_dnsmasq(lan_if, lan_cidr)

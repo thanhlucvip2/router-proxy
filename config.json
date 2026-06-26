@@ -1,0 +1,536 @@
+{
+  "dhcp_bindings": {
+    "dc:04:5a:f5:f6:d2": {
+      "name": "Samsung S8 Box1 01",
+      "ip_address": "10.42.2.1"
+    },
+    "dc:04:5a:f5:f6:d3": {
+      "name": "Samsung S8 Box1 02",
+      "ip_address": "10.42.2.2"
+    },
+    "dc:04:5a:f5:f6:ce": {
+      "name": "Samsung S8 Box1 03",
+      "ip_address": "10.42.2.3"
+    },
+    "dc:04:5a:f5:f6:d1": {
+      "name": "Samsung S8 Box1 04",
+      "ip_address": "10.42.2.4"
+    },
+    "dc:04:5a:f5:f6:d5": {
+      "name": "Samsung S8 Box1 05",
+      "ip_address": "10.42.2.5"
+    },
+    "dc:04:5a:f5:f6:d4": {
+      "name": "Samsung S8 Box1 06",
+      "ip_address": "10.42.2.6"
+    },
+    "dc:04:5a:f5:f6:d6": {
+      "name": "Samsung S8 Box1 07",
+      "ip_address": "10.42.2.7"
+    },
+    "dc:04:5a:f5:f6:d8": {
+      "name": "Samsung S8 Box1 08",
+      "ip_address": "10.42.2.8"
+    },
+    "dc:04:5a:f5:f6:da": {
+      "name": "Samsung S8 Box1 09",
+      "ip_address": "10.42.2.9"
+    },
+    "dc:04:5a:f5:f6:e1": {
+      "name": "Samsung S8 Box1 10",
+      "ip_address": "10.42.2.10"
+    },
+    "dc:04:5a:f5:f6:dc": {
+      "name": "Samsung S8 Box1 11",
+      "ip_address": "10.42.2.11"
+    },
+    "dc:04:5a:f5:f6:e0": {
+      "name": "Samsung S8 Box1 12",
+      "ip_address": "10.42.2.12"
+    },
+    "dc:04:5a:f5:f6:de": {
+      "name": "Samsung S8 Box1 13",
+      "ip_address": "10.42.2.13"
+    },
+    "dc:04:5a:f5:f6:e3": {
+      "name": "Samsung S8 Box1 14",
+      "ip_address": "10.42.2.14"
+    },
+    "dc:04:5a:f5:f6:d7": {
+      "name": "Samsung S8 Box1 15",
+      "ip_address": "10.42.2.15"
+    },
+    "dc:04:5a:f5:f6:e2": {
+      "name": "Samsung S8 Box1 16",
+      "ip_address": "10.42.2.16"
+    },
+    "dc:04:5a:f5:f6:dd": {
+      "name": "Samsung S8 Box1 17",
+      "ip_address": "10.42.2.17"
+    },
+    "dc:04:5a:f5:f6:db": {
+      "name": "Samsung S8 Box1 18",
+      "ip_address": "10.42.2.18"
+    },
+    "dc:04:5a:f5:f6:d0": {
+      "name": "Samsung S8 Box1 19",
+      "ip_address": "10.42.2.19"
+    },
+    "dc:04:5a:f5:f6:e4": {
+      "name": "Samsung S8 Box1 20",
+      "ip_address": "10.42.2.20"
+    },
+    "dc:32:62:12:ec:05": {
+      "name": "Samsung S8 Box2 01",
+      "ip_address": "10.42.2.21"
+    },
+    "dc:32:62:12:ec:0a": {
+      "name": "Samsung S8 Box2 02",
+      "ip_address": "10.42.2.22"
+    },
+    "dc:32:62:12:ec:0c": {
+      "name": "Samsung S8 Box2 03",
+      "ip_address": "10.42.2.23"
+    },
+    "dc:32:62:12:ec:0d": {
+      "name": "Samsung S8 Box2 04",
+      "ip_address": "10.42.2.24"
+    },
+    "dc:32:62:12:ec:0f": {
+      "name": "Samsung S8 Box2 05",
+      "ip_address": "10.42.2.25"
+    },
+    "dc:32:62:12:ec:10": {
+      "name": "Samsung S8 Box2 06",
+      "ip_address": "10.42.2.26"
+    },
+    "dc:32:62:12:ec:11": {
+      "name": "Samsung S8 Box2 07",
+      "ip_address": "10.42.2.27"
+    },
+    "dc:32:62:12:ec:12": {
+      "name": "Samsung S8 Box2 08",
+      "ip_address": "10.42.2.28"
+    },
+    "dc:32:62:12:ec:13": {
+      "name": "Samsung S8 Box2 09",
+      "ip_address": "10.42.2.29"
+    },
+    "dc:32:62:12:ec:14": {
+      "name": "Samsung S8 Box2 10",
+      "ip_address": "10.42.2.30"
+    },
+    "dc:32:62:12:ec:15": {
+      "name": "Samsung S8 Box2 11",
+      "ip_address": "10.42.2.31"
+    },
+    "dc:32:62:12:ec:16": {
+      "name": "Samsung S8 Box2 12",
+      "ip_address": "10.42.2.32"
+    },
+    "dc:32:62:12:ec:17": {
+      "name": "Samsung S8 Box2 13",
+      "ip_address": "10.42.2.33"
+    },
+    "dc:32:62:12:ec:18": {
+      "name": "Samsung S8 Box2 14",
+      "ip_address": "10.42.2.34"
+    },
+    "dc:32:62:12:ec:19": {
+      "name": "Samsung S8 Box2 15",
+      "ip_address": "10.42.2.35"
+    },
+    "dc:32:62:12:ec:1a": {
+      "name": "Samsung S8 Box2 16",
+      "ip_address": "10.42.2.36"
+    },
+    "dc:32:62:12:ec:1b": {
+      "name": "Samsung S8 Box2 17",
+      "ip_address": "10.42.2.37"
+    },
+    "dc:32:62:12:ec:1c": {
+      "name": "Samsung S8 Box2 18",
+      "ip_address": "10.42.2.38"
+    },
+    "dc:32:62:12:ec:1d": {
+      "name": "Samsung S8 Box2 19",
+      "ip_address": "10.42.2.39"
+    },
+    "dc:32:62:12:ec:20": {
+      "name": "Samsung S8 Box2 20",
+      "ip_address": "10.42.2.40"
+    },
+    "54:6c:50:32:2c:79": {
+      "name": "Samsung S8 Box3 01",
+      "ip_address": "10.42.2.41"
+    },
+    "54:6c:50:32:2c:7a": {
+      "name": "Samsung S8 Box3 02",
+      "ip_address": "10.42.2.42"
+    },
+    "54:6c:50:32:2c:7b": {
+      "name": "Samsung S8 Box3 03",
+      "ip_address": "10.42.2.43"
+    },
+    "54:6c:50:32:2c:7c": {
+      "name": "Samsung S8 Box3 04",
+      "ip_address": "10.42.2.44"
+    },
+    "54:6c:50:32:2c:7d": {
+      "name": "Samsung S8 Box3 05",
+      "ip_address": "10.42.2.45"
+    },
+    "54:6c:50:32:2c:7e": {
+      "name": "Samsung S8 Box3 06",
+      "ip_address": "10.42.2.46"
+    },
+    "54:6c:50:32:2c:7f": {
+      "name": "Samsung S8 Box3 07",
+      "ip_address": "10.42.2.47"
+    },
+    "54:6c:50:32:2c:80": {
+      "name": "Samsung S8 Box3 08",
+      "ip_address": "10.42.2.48"
+    },
+    "54:6c:50:32:2c:81": {
+      "name": "Samsung S8 Box3 09",
+      "ip_address": "10.42.2.49"
+    },
+    "54:6c:50:32:2c:82": {
+      "name": "Samsung S8 Box3 10",
+      "ip_address": "10.42.2.50"
+    },
+    "54:6c:50:32:2c:83": {
+      "name": "Samsung S8 Box3 11",
+      "ip_address": "10.42.2.51"
+    },
+    "54:6c:50:32:2c:84": {
+      "name": "Samsung S8 Box3 12",
+      "ip_address": "10.42.2.52"
+    },
+    "54:6c:50:32:2c:85": {
+      "name": "Samsung S8 Box3 13",
+      "ip_address": "10.42.2.53"
+    },
+    "54:6c:50:32:2c:86": {
+      "name": "Samsung S8 Box3 14",
+      "ip_address": "10.42.2.54"
+    },
+    "54:6c:50:32:2c:87": {
+      "name": "Samsung S8 Box3 15",
+      "ip_address": "10.42.2.55"
+    },
+    "54:6c:50:32:2c:88": {
+      "name": "Samsung S8 Box3 16",
+      "ip_address": "10.42.2.56"
+    },
+    "54:6c:50:32:2c:89": {
+      "name": "Samsung S8 Box3 17",
+      "ip_address": "10.42.2.57"
+    },
+    "54:6c:50:32:2c:8a": {
+      "name": "Samsung S8 Box3 18",
+      "ip_address": "10.42.2.58"
+    },
+    "54:6c:50:32:2c:8b": {
+      "name": "Samsung S8 Box3 19",
+      "ip_address": "10.42.2.59"
+    },
+    "54:6c:50:32:2c:8e": {
+      "name": "Samsung S8 Box3 20",
+      "ip_address": "10.42.2.60"
+    },
+    "54:6c:50:32:2f:12": {
+      "name": "Samsung S8 Box4 01",
+      "ip_address": "10.42.2.61"
+    },
+    "54:6c:50:32:2f:13": {
+      "name": "Samsung S8 Box4 02",
+      "ip_address": "10.42.2.62"
+    },
+    "54:6c:50:32:2f:14": {
+      "name": "Samsung S8 Box4 03",
+      "ip_address": "10.42.2.63"
+    },
+    "54:6c:50:32:2f:16": {
+      "name": "Samsung S8 Box4 04",
+      "ip_address": "10.42.2.64"
+    },
+    "54:6c:50:32:2f:17": {
+      "name": "Samsung S8 Box4 05",
+      "ip_address": "10.42.2.65"
+    },
+    "54:6c:50:32:2f:18": {
+      "name": "Samsung S8 Box4 06",
+      "ip_address": "10.42.2.66"
+    },
+    "54:6c:50:32:2f:19": {
+      "name": "Samsung S8 Box4 07",
+      "ip_address": "10.42.2.67"
+    },
+    "54:6c:50:32:2f:1a": {
+      "name": "Samsung S8 Box4 08",
+      "ip_address": "10.42.2.68"
+    },
+    "54:6c:50:32:2f:1b": {
+      "name": "Samsung S8 Box4 09",
+      "ip_address": "10.42.2.69"
+    },
+    "54:6c:50:32:2f:1c": {
+      "name": "Samsung S8 Box4 10",
+      "ip_address": "10.42.2.70"
+    },
+    "54:6c:50:32:2f:1d": {
+      "name": "Samsung S8 Box4 11",
+      "ip_address": "10.42.2.71"
+    },
+    "54:6c:50:32:2f:1e": {
+      "name": "Samsung S8 Box4 12",
+      "ip_address": "10.42.2.72"
+    },
+    "54:6c:50:32:2f:1f": {
+      "name": "Samsung S8 Box4 13",
+      "ip_address": "10.42.2.73"
+    },
+    "54:6c:50:32:2f:20": {
+      "name": "Samsung S8 Box4 14",
+      "ip_address": "10.42.2.74"
+    },
+    "54:6c:50:32:2f:21": {
+      "name": "Samsung S8 Box4 15",
+      "ip_address": "10.42.2.75"
+    },
+    "54:6c:50:32:2f:22": {
+      "name": "Samsung S8 Box4 16",
+      "ip_address": "10.42.2.76"
+    },
+    "54:6c:50:32:2f:23": {
+      "name": "Samsung S8 Box4 17",
+      "ip_address": "10.42.2.77"
+    },
+    "54:6c:50:32:2f:24": {
+      "name": "Samsung S8 Box4 18",
+      "ip_address": "10.42.2.78"
+    },
+    "54:6c:50:32:2f:25": {
+      "name": "Samsung S8 Box4 19",
+      "ip_address": "10.42.2.79"
+    },
+    "54:6c:50:32:2f:27": {
+      "name": "Samsung S8 Box4 20",
+      "ip_address": "10.42.2.80"
+    },
+    "dc:04:5a:f5:f0:c2": {
+      "name": "Samsung Note8 Box5 01",
+      "ip_address": "10.42.2.81"
+    },
+    "dc:04:5a:f5:f0:c6": {
+      "name": "Samsung Note8 Box5 02",
+      "ip_address": "10.42.2.82"
+    },
+    "dc:04:5a:f5:f0:c8": {
+      "name": "Samsung Note8 Box5 03",
+      "ip_address": "10.42.2.83"
+    },
+    "dc:04:5a:f5:f0:c5": {
+      "name": "Samsung Note8 Box5 04",
+      "ip_address": "10.42.2.84"
+    },
+    "dc:04:5a:f5:f0:c9": {
+      "name": "Samsung Note8 Box5 05",
+      "ip_address": "10.42.2.85"
+    },
+    "dc:04:5a:f5:f0:cc": {
+      "name": "Samsung Note8 Box5 06",
+      "ip_address": "10.42.2.86"
+    },
+    "dc:04:5a:f5:f0:cb": {
+      "name": "Samsung Note8 Box5 07",
+      "ip_address": "10.42.2.87"
+    },
+    "dc:04:5a:f5:f0:c7": {
+      "name": "Samsung Note8 Box5 08",
+      "ip_address": "10.42.2.88"
+    },
+    "dc:04:5a:f5:f0:d4": {
+      "name": "Samsung Note8 Box5 09",
+      "ip_address": "10.42.2.89"
+    },
+    "dc:04:5a:f5:f0:d7": {
+      "name": "Samsung Note8 Box5 10",
+      "ip_address": "10.42.2.90"
+    },
+    "dc:04:5a:f5:f0:ca": {
+      "name": "Samsung Note8 Box5 11",
+      "ip_address": "10.42.2.91"
+    },
+    "dc:04:5a:f5:f0:d2": {
+      "name": "Samsung Note8 Box5 12",
+      "ip_address": "10.42.2.92"
+    },
+    "dc:04:5a:f5:f0:d0": {
+      "name": "Samsung Note8 Box5 13",
+      "ip_address": "10.42.2.93"
+    },
+    "dc:04:5a:f5:f0:d6": {
+      "name": "Samsung Note8 Box5 14",
+      "ip_address": "10.42.2.94"
+    },
+    "dc:04:5a:f5:f0:ce": {
+      "name": "Samsung Note8 Box5 15",
+      "ip_address": "10.42.2.95"
+    },
+    "dc:04:5a:f5:f0:d1": {
+      "name": "Samsung Note8 Box5 16",
+      "ip_address": "10.42.2.96"
+    },
+    "dc:04:5a:f5:f0:d3": {
+      "name": "Samsung Note8 Box5 17",
+      "ip_address": "10.42.2.97"
+    },
+    "dc:04:5a:f5:f0:cf": {
+      "name": "Samsung Note8 Box5 18",
+      "ip_address": "10.42.2.98"
+    },
+    "dc:04:5a:f5:f0:cd": {
+      "name": "Samsung Note8 Box5 19",
+      "ip_address": "10.42.2.99"
+    }
+  },
+  "device_groups": [
+    {
+      "id": "group-1782463361-d5e0968a",
+      "name": "Samsung S8 Box 1",
+      "ips": [
+        "10.42.2.1",
+        "10.42.2.2",
+        "10.42.2.3",
+        "10.42.2.4",
+        "10.42.2.5",
+        "10.42.2.6",
+        "10.42.2.7",
+        "10.42.2.8",
+        "10.42.2.9",
+        "10.42.2.10",
+        "10.42.2.11",
+        "10.42.2.12",
+        "10.42.2.13",
+        "10.42.2.14",
+        "10.42.2.15",
+        "10.42.2.16",
+        "10.42.2.17",
+        "10.42.2.18",
+        "10.42.2.19",
+        "10.42.2.20"
+      ],
+      "collapsed": true
+    },
+    {
+      "id": "group-1782463948-1c775890",
+      "name": "Samsung S8 Box 2",
+      "ips": [
+        "10.42.2.21",
+        "10.42.2.22",
+        "10.42.2.23",
+        "10.42.2.24",
+        "10.42.2.25",
+        "10.42.2.26",
+        "10.42.2.27",
+        "10.42.2.28",
+        "10.42.2.29",
+        "10.42.2.30",
+        "10.42.2.31",
+        "10.42.2.32",
+        "10.42.2.33",
+        "10.42.2.34",
+        "10.42.2.35",
+        "10.42.2.36",
+        "10.42.2.37",
+        "10.42.2.38",
+        "10.42.2.39",
+        "10.42.2.40"
+      ],
+      "collapsed": true
+    },
+    {
+      "id": "group-1782463983-6dfaa86c",
+      "name": "Samsung S8 Box 3",
+      "ips": [
+        "10.42.2.41",
+        "10.42.2.42",
+        "10.42.2.43",
+        "10.42.2.44",
+        "10.42.2.45",
+        "10.42.2.46",
+        "10.42.2.47",
+        "10.42.2.48",
+        "10.42.2.49",
+        "10.42.2.50",
+        "10.42.2.51",
+        "10.42.2.52",
+        "10.42.2.53",
+        "10.42.2.54",
+        "10.42.2.55",
+        "10.42.2.56",
+        "10.42.2.57",
+        "10.42.2.58",
+        "10.42.2.59",
+        "10.42.2.60"
+      ],
+      "collapsed": true
+    },
+    {
+      "id": "group-1782464014-65d192a0",
+      "name": "Samsung S8 Box 4",
+      "ips": [
+        "10.42.2.61",
+        "10.42.2.62",
+        "10.42.2.63",
+        "10.42.2.64",
+        "10.42.2.65",
+        "10.42.2.66",
+        "10.42.2.67",
+        "10.42.2.68",
+        "10.42.2.69",
+        "10.42.2.70",
+        "10.42.2.71",
+        "10.42.2.72",
+        "10.42.2.73",
+        "10.42.2.74",
+        "10.42.2.75",
+        "10.42.2.76",
+        "10.42.2.77",
+        "10.42.2.78",
+        "10.42.2.79",
+        "10.42.2.80"
+      ],
+      "collapsed": true
+    },
+    {
+      "id": "group-1782464045-881a3bfd",
+      "name": "Samsung Note8 Box 5",
+      "ips": [
+        "10.42.2.81",
+        "10.42.2.82",
+        "10.42.2.83",
+        "10.42.2.84",
+        "10.42.2.85",
+        "10.42.2.86",
+        "10.42.2.87",
+        "10.42.2.88",
+        "10.42.2.89",
+        "10.42.2.90",
+        "10.42.2.91",
+        "10.42.2.92",
+        "10.42.2.93",
+        "10.42.2.94",
+        "10.42.2.95",
+        "10.42.2.96",
+        "10.42.2.97",
+        "10.42.2.98",
+        "10.42.2.99"
+      ],
+      "collapsed": true
+    }
+  ]
+}

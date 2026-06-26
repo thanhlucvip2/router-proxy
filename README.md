@@ -2,11 +2,11 @@
 
 Quick test setup for this PC:
 
-- WAN/internet input: `enp8s0`
-- LAN outputs: `enp3s0f0`, `enp3s0f1`
+- WAN/internet input: `enp3s0f1`
+- LAN outputs: `enp3s0f0`, `enp8s0`
 - WiFi hotspot: `wlp7s0`
-- LAN gateway: `10.42.0.1/24`
-- DHCP range: auto-derived from `10.42.0.1/24`
+- LAN gateway: `10.42.0.1/21`
+- DHCP range: auto-derived from `10.42.0.1/21`
 - Web dashboard: `http://127.0.0.1:4500`
 - From a laptop plugged into LAN output: `http://10.42.0.1:4500`
 - Admin username: `admin`
