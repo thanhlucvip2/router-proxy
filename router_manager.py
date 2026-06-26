@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import hashlib
 import html
 import ipaddress
 import json
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -35,11 +37,15 @@ DOMAIN_PROXY_PREFIX = "domain_proxy"
 WEB_PID = STATE_DIR / "router_manager.pid"
 ADMIN_PASSWORD_FILE = STATE_DIR / "admin_password.txt"
 SESSION_FILE = STATE_DIR / "session_token.txt"
+NETWORKD_RUNTIME_DIR = Path("/run/systemd/network")
+NETWORKD_PREFIX = "00-router-manager"
 
 DEFAULT_LAN_CIDR = "10.42.0.1/24"
 DEFAULT_BRIDGE_IF = "br-router"
 DEFAULT_WIFI_SSID = "RouterWiFi"
 DEFAULT_WIFI_CHANNEL = 6
+DEFAULT_WIFI_BAND = "2.4"
+DEFAULT_WIFI_COUNTRY = "US"
 DEFAULT_ADMIN_USER = "admin"
 PROXY_CHAIN = "ROUTER_PROXY"
 GUARD_CHAIN = "ROUTER_GUARD"
@@ -50,6 +56,22 @@ PROXY_TEST_URLS = {
     "6": "https://api6.ipify.org",
 }
 BALANCE_FAMILIES = ("all", "4", "6")
+UDP_GUARD_PORTS = ("443", "3478:3481", "5349", "19302:19309")
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+ONLINE_NEIGH_STATES = {"REACHABLE", "DELAY", "PROBE", "STALE"}
+OFFLINE_NEIGH_STATES = {"FAILED", "INCOMPLETE"}
+WIFI_24_CHANNELS = tuple(range(1, 14))
+WIFI_5_CHANNELS = (36, 40, 44, 48, 149, 153, 157, 161)
+WIFI_5_CENTER_SEG0 = {
+    36: 42,
+    40: 42,
+    44: 42,
+    48: 42,
+    149: 155,
+    153: 155,
+    157: 155,
+    161: 155,
+}
 PRIVATE_NETS = (
     "0.0.0.0/8",
     "10.0.0.0/8",
@@ -61,6 +83,38 @@ PRIVATE_NETS = (
     "224.0.0.0/4",
     "240.0.0.0/4",
 )
+
+
+def wifi_band(value):
+    cleaned = str(value or "").strip().lower().replace("ghz", "").replace(" ", "")
+    if cleaned in ("2.4", "2", "24", "2g", "b", "g", "n"):
+        return "2.4"
+    if cleaned in ("5", "5g", "a", "ac", "ax"):
+        return "5"
+    return ""
+
+
+def wifi_band_label(value):
+    return "5 GHz fast" if wifi_band(value) == "5" else "2.4 GHz compatible"
+
+
+def default_channel_for_band(band):
+    return 36 if wifi_band(band) == "5" else DEFAULT_WIFI_CHANNEL
+
+
+def valid_channels_for_band(band):
+    return WIFI_5_CHANNELS if wifi_band(band) == "5" else WIFI_24_CHANNELS
+
+
+def ht40_capab_for_channel(channel):
+    return "[HT40+]" if channel in (36, 44, 149, 157) else "[HT40-]"
+
+
+def normalize_wifi_country(value):
+    country = str(value or DEFAULT_WIFI_COUNTRY).strip().upper()
+    if len(country) == 2 and country.isalpha():
+        return country
+    return DEFAULT_WIFI_COUNTRY
 
 
 def sh(cmd, check=True, capture=True):
@@ -85,6 +139,22 @@ def sudo(cmd, check=True, capture=True):
 def sudo_success(cmd):
     actual = cmd if os.geteuid() == 0 else ["sudo", "-n", *cmd]
     return subprocess.run(actual, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def sudo_write_text(path, text):
+    path = Path(path)
+    if os.geteuid() == 0:
+        path.write_text(text)
+        return
+    result = subprocess.run(
+        ["sudo", "-n", "tee", str(path)],
+        input=text,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Khong ghi duoc {path}: {(result.stderr or '').strip()}")
 
 
 def delete_existing_rule(cmd):
@@ -117,12 +187,32 @@ def require_interface(ifname, role):
         raise RuntimeError(f"{role} interface {ifname!r} khong ton tai. Interfaces hien co: {shown}")
 
 
+def interface_list(value):
+    if isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = str(value or "").replace(",", " ").split()
+    items = []
+    for item in raw_items:
+        name = str(item).strip()
+        if name and name not in items:
+            items.append(name)
+    return items
+
+
+def primary_interface(value):
+    items = interface_list(value)
+    return items[0] if items else ""
+
+
 def default_hotspot():
     return {
         "enabled": False,
         "ifname": "",
         "ssid": DEFAULT_WIFI_SSID,
         "password": "",
+        "band": DEFAULT_WIFI_BAND,
+        "country": DEFAULT_WIFI_COUNTRY,
         "channel": DEFAULT_WIFI_CHANNEL,
     }
 
@@ -131,6 +221,8 @@ def default_state():
     return {
         "proxies": [],
         "assignments": {},
+        "device_names": {},
+        "dhcp_reservations": {},
         "lan_cidr": DEFAULT_LAN_CIDR,
         "hotspot": default_hotspot(),
     }
@@ -147,11 +239,15 @@ def normalized_hotspot(state):
     config["ifname"] = str(config.get("ifname", "")).strip()
     config["ssid"] = str(config.get("ssid", "")).strip() or DEFAULT_WIFI_SSID
     config["password"] = str(config.get("password", ""))
+    config["band"] = wifi_band(config.get("band")) or DEFAULT_WIFI_BAND
+    config["country"] = normalize_wifi_country(config.get("country"))
     try:
         channel = int(config.get("channel", DEFAULT_WIFI_CHANNEL))
     except (TypeError, ValueError):
-        channel = DEFAULT_WIFI_CHANNEL
-    config["channel"] = channel if 1 <= channel <= 13 else DEFAULT_WIFI_CHANNEL
+        channel = default_channel_for_band(config["band"])
+    if channel not in valid_channels_for_band(config["band"]):
+        channel = default_channel_for_band(config["band"])
+    config["channel"] = channel
     return config
 
 
@@ -162,7 +258,11 @@ def load_state():
     state = json.loads(STATE_FILE.read_text())
     state.setdefault("proxies", [])
     state.setdefault("assignments", {})
+    state.setdefault("device_names", {})
+    state.setdefault("dhcp_reservations", {})
     state.setdefault("lan_cidr", DEFAULT_LAN_CIDR)
+    state.setdefault("device_presence", {})
+    state.setdefault("hidden_offline_devices", {})
     state["hotspot"] = normalized_hotspot(state)
     return state
 
@@ -183,6 +283,92 @@ def save_state(state):
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
     tmp.replace(STATE_FILE)
+
+
+def websocket_accept_key(client_key):
+    digest = hashlib.sha1((client_key + WEBSOCKET_GUID).encode()).digest()
+    return base64.b64encode(digest).decode()
+
+
+def websocket_frame(payload, opcode=0x1):
+    if isinstance(payload, str):
+        payload = payload.encode()
+    length = len(payload)
+    header = bytearray([0x80 | opcode])
+    if length < 126:
+        header.append(length)
+    elif length < 65536:
+        header.extend([126, (length >> 8) & 0xFF, length & 0xFF])
+    else:
+        header.extend(
+            [
+                127,
+                (length >> 56) & 0xFF,
+                (length >> 48) & 0xFF,
+                (length >> 40) & 0xFF,
+                (length >> 32) & 0xFF,
+                (length >> 24) & 0xFF,
+                (length >> 16) & 0xFF,
+                (length >> 8) & 0xFF,
+                length & 0xFF,
+            ]
+        )
+    return bytes(header) + payload
+
+
+def websocket_send_json(conn, data):
+    conn.sendall(websocket_frame(json.dumps(data, separators=(",", ":"))))
+
+
+def websocket_recv_exact(conn, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = conn.recv(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def websocket_read_message(conn):
+    try:
+        header = websocket_recv_exact(conn, 2)
+    except socket.timeout:
+        return None
+    if not header:
+        return {"type": "close"}
+    first, second = header
+    opcode = first & 0x0F
+    masked = bool(second & 0x80)
+    length = second & 0x7F
+    if length == 126:
+        extended = websocket_recv_exact(conn, 2)
+        if not extended:
+            return {"type": "close"}
+        length = int.from_bytes(extended, "big")
+    elif length == 127:
+        extended = websocket_recv_exact(conn, 8)
+        if not extended:
+            return {"type": "close"}
+        length = int.from_bytes(extended, "big")
+    mask = websocket_recv_exact(conn, 4) if masked else b""
+    payload = websocket_recv_exact(conn, length) if length else b""
+    if payload is None:
+        return {"type": "close"}
+    if masked and mask:
+        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    if opcode == 0x8:
+        return {"type": "close"}
+    if opcode == 0x9:
+        return {"type": "ping", "payload": payload}
+    if opcode != 0x1:
+        return None
+    try:
+        return {"type": "text", "text": payload.decode()}
+    except UnicodeDecodeError:
+        return None
 
 
 def load_or_create_admin_password():
@@ -270,8 +456,12 @@ def dhcp_range_for(lan_cidr):
     last = int(network.broadcast_address) - 1
     if first > last:
         raise ValueError("LAN CIDR qua nho, khong co dia chi DHCP kha dung")
-    start = max(first, int(network.network_address) + 50)
-    end = min(last, int(network.network_address) + 200)
+    if network.num_addresses > 512:
+        start = max(first, int(network.network_address) + 257)
+        end = min(last, int(network.broadcast_address) - 257)
+    else:
+        start = max(first, int(network.network_address) + 50)
+        end = min(last, int(network.network_address) + 200)
     if start > end:
         start, end = first, last
     if start == gateway:
@@ -281,6 +471,59 @@ def dhcp_range_for(lan_cidr):
     if start > end:
         raise ValueError("Khong tao duoc DHCP range khac IP gateway")
     return str(ipaddress.ip_address(start)), str(ipaddress.ip_address(end)), str(network.netmask)
+
+
+def normalize_lan_cidr(value):
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError("LAN CIDR khong duoc de trong")
+    if "/" not in value:
+        value += "/24"
+    iface = ipaddress.ip_interface(value)
+    if iface.version != 4:
+        raise ValueError("LAN CIDR phai la IPv4, vi du 10.42.7.1/24 hoac 10.42.0.1/16")
+    network = iface.network
+    if iface.ip == network.network_address or iface.ip == network.broadcast_address:
+        raise ValueError("IP gateway khong duoc la network/broadcast address")
+    dhcp_range_for(iface.with_prefixlen)
+    return iface.with_prefixlen
+
+
+def prune_lan_scoped_state(state, lan_cidr):
+    lan_net = ipaddress.ip_interface(lan_cidr).network
+    assignments = {}
+    for client_ip, proxy_idx in state.get("assignments", {}).items():
+        try:
+            if ipaddress.ip_address(client_ip) in lan_net:
+                assignments[client_ip] = proxy_idx
+        except ValueError:
+            continue
+    state["assignments"] = assignments
+    reservations = {}
+    for mac, client_ip in state.get("dhcp_reservations", {}).items():
+        mac = normalize_mac(mac)
+        try:
+            if mac and ipaddress.ip_address(client_ip) in lan_net:
+                reservations[mac] = client_ip
+        except ValueError:
+            continue
+    state["dhcp_reservations"] = reservations
+
+
+def normalize_dhcp_reservation_ip(value, lan_cidr):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    ip = ipaddress.ip_address(value)
+    if ip.version != 4:
+        raise ValueError("DHCP IP phai la IPv4")
+    iface = ipaddress.ip_interface(lan_cidr)
+    network = iface.network
+    if ip not in network:
+        raise ValueError(f"DHCP IP phai nam trong LAN {network}")
+    if ip in (network.network_address, network.broadcast_address, iface.ip):
+        raise ValueError("DHCP IP khong duoc la gateway/network/broadcast")
+    return str(ip)
 
 
 def current_mac(ifname):
@@ -301,6 +544,31 @@ def renew_interface(ifname):
         sudo(["networkctl", "renew", ifname], check=False)
     if shutil.which("nmcli"):
         sh(["nmcli", "device", "reapply", ifname], check=False)
+
+
+def set_nm_managed(ifname, managed):
+    if ifname and shutil.which("nmcli"):
+        sudo(["nmcli", "device", "set", ifname, "managed", "yes" if managed else "no"], check=False)
+
+
+def networkd_config_path(ifname):
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in ifname)
+    return NETWORKD_RUNTIME_DIR / f"{NETWORKD_PREFIX}-{safe}.network"
+
+
+def set_networkd_unmanaged(ifnames, unmanaged):
+    names = interface_list(ifnames)
+    if not names or not shutil.which("networkctl") or not NETWORKD_RUNTIME_DIR.exists():
+        return
+    for ifname in names:
+        path = networkd_config_path(ifname)
+        if unmanaged:
+            sudo_write_text(path, f"[Match]\nName={ifname}\n\n[Link]\nUnmanaged=yes\n")
+        else:
+            sudo(["rm", "-f", str(path)], check=False)
+    sudo(["networkctl", "reload"], check=False)
+    for ifname in names:
+        sudo(["networkctl", "reconfigure", ifname], check=False)
 
 
 def rotate_interface_mac(ifname):
@@ -342,11 +610,22 @@ def stop_pid(pid_file):
     Path(pid_file).unlink(missing_ok=True)
 
 
+def process_alive(pid):
+    return sudo_success(["kill", "-0", str(pid)])
+
+
+def signal_process(pid, sig):
+    sudo(["kill", f"-{sig.name.removeprefix('SIG')}", str(pid)], check=False)
+
+
 def active_lan_if(base_lan_if, state=None):
     hotspot = normalized_hotspot(state or load_state())
+    lan_members = interface_list(base_lan_if)
+    if len(lan_members) > 1:
+        return DEFAULT_BRIDGE_IF
     if hotspot["enabled"] and hotspot["ifname"]:
         return DEFAULT_BRIDGE_IF
-    return base_lan_if
+    return primary_interface(base_lan_if)
 
 
 def validate_hostapd_text(value, label):
@@ -380,22 +659,39 @@ def parse_hotspot_form(data, existing_state, wan_if):
         raise ValueError("Password WiFi phai tu 8 den 63 ky tu")
     if any(ord(ch) < 32 or ord(ch) > 126 for ch in password):
         raise ValueError("Password WiFi chi ho tro ASCII in duoc")
+    band = wifi_band(data.get("band", current.get("band", DEFAULT_WIFI_BAND)))
+    if not band:
+        raise ValueError("Band WiFi chi ho tro 2.4 hoac 5 GHz")
+    country = str(data.get("country", current.get("country", DEFAULT_WIFI_COUNTRY))).strip().upper()
+    if len(country) != 2 or not country.isalpha():
+        raise ValueError("Country code WiFi phai gom 2 chu cai, vi du US")
+    channel_raw = str(data.get("channel", "")).strip()
     try:
-        channel = int(data.get("channel", current.get("channel", DEFAULT_WIFI_CHANNEL)))
+        channel = int(channel_raw) if channel_raw else int(current.get("channel", default_channel_for_band(band)))
     except (TypeError, ValueError):
-        channel = DEFAULT_WIFI_CHANNEL
-    if channel < 1 or channel > 13:
-        raise ValueError("Kenh WiFi phai nam trong 1-13")
+        channel = default_channel_for_band(band)
+    if channel not in valid_channels_for_band(band):
+        if channel_raw and wifi_band(current.get("band")) == band:
+            allowed = ", ".join(str(item) for item in valid_channels_for_band(band))
+            raise ValueError(f"Kenh WiFi {wifi_band_label(band)} chi ho tro: {allowed}")
+        channel = default_channel_for_band(band)
     return {
         "enabled": True,
         "ifname": ifname,
         "ssid": ssid,
         "password": password,
+        "band": band,
+        "country": country,
         "channel": channel,
     }
 
 
 def write_hostapd_conf(config, bridge_if=""):
+    band = wifi_band(config.get("band")) or DEFAULT_WIFI_BAND
+    country = normalize_wifi_country(config.get("country"))
+    channel = int(config.get("channel", default_channel_for_band(band)))
+    if channel not in valid_channels_for_band(band):
+        channel = default_channel_for_band(band)
     lines = [
         f"interface={config['ifname']}",
         "driver=nl80211",
@@ -405,9 +701,35 @@ def write_hostapd_conf(config, bridge_if=""):
     lines.extend(
         [
             f"ssid={config['ssid']}",
-            "hw_mode=g",
-            f"channel={config['channel']}",
-            "ieee80211n=1",
+            f"country_code={country}",
+            "ieee80211d=1",
+        ]
+    )
+    if band == "5":
+        center_seg0 = WIFI_5_CENTER_SEG0[channel]
+        lines.extend(
+            [
+                "hw_mode=a",
+                f"channel={channel}",
+                "ieee80211n=1",
+                f"ht_capab={ht40_capab_for_channel(channel)}[SHORT-GI-20][SHORT-GI-40]",
+                "ieee80211ac=1",
+                "ieee80211h=1",
+                "vht_oper_chwidth=1",
+                f"vht_oper_centr_freq_seg0_idx={center_seg0}",
+                "vht_capab=[MAX-MPDU-11454][SHORT-GI-80]",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "hw_mode=g",
+                f"channel={channel}",
+                "ieee80211n=1",
+            ]
+        )
+    lines.extend(
+        [
             "wmm_enabled=1",
             "auth_algs=1",
             "wpa=2",
@@ -417,9 +739,7 @@ def write_hostapd_conf(config, bridge_if=""):
             "",
         ]
     )
-    HOSTAPD_CONF.write_text(
-        "\n".join(lines)
-    )
+    HOSTAPD_CONF.write_text("\n".join(lines))
     HOSTAPD_CONF.chmod(0o600)
 
 
@@ -455,8 +775,7 @@ def stop_hotspot(config=None):
         config = normalized_hotspot({"hotspot": config})
     stop_pid(HOSTAPD_PID)
     stop_hostapd_processes()
-    if config.get("ifname") and shutil.which("nmcli"):
-        sudo(["nmcli", "device", "set", config["ifname"], "managed", "yes"], check=False)
+    set_nm_managed(config.get("ifname"), True)
     if config.get("ifname"):
         sudo(["ip", "link", "set", "dev", config["ifname"], "nomaster"], check=False)
 
@@ -470,12 +789,16 @@ def start_hotspot(config, bridge_if=""):
     require_interface(config["ifname"], "WiFi")
     stop_hotspot(config)
     write_hostapd_conf(config, bridge_if)
+    if shutil.which("iw"):
+        sudo(["iw", "reg", "set", config["country"]], check=False)
     sudo(["systemctl", "stop", "hostapd"], check=False)
     if shutil.which("rfkill"):
         sudo(["rfkill", "unblock", "wifi"], check=False)
     if shutil.which("nmcli"):
         sudo(["nmcli", "device", "disconnect", config["ifname"]], check=False)
-        sudo(["nmcli", "device", "set", config["ifname"], "managed", "no"], check=False)
+    set_nm_managed(config["ifname"], False)
+    if shutil.which("iw"):
+        sudo(["iw", "dev", config["ifname"], "set", "power_save", "off"], check=False)
     sudo(["ip", "link", "set", config["ifname"], "up"], check=False)
     sudo(["hostapd", "-B", "-P", str(HOSTAPD_PID), str(HOSTAPD_CONF)])
     for _ in range(15):
@@ -597,19 +920,14 @@ def stop_web_server():
     targets.discard(os.getpid())
     for pid in targets:
         for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
+            if not process_alive(pid):
                 break
+            signal_process(pid, sig)
             for _ in range(20):
                 time.sleep(0.1)
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
+                if not process_alive(pid):
                     break
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not process_alive(pid):
                 break
     WEB_PID.unlink(missing_ok=True)
 
@@ -617,6 +935,16 @@ def stop_web_server():
 def write_dnsmasq_conf(lan_if, lan_cidr):
     lan_ip, _, _ = cidr_parts(lan_cidr)
     dhcp_start, dhcp_end, netmask = dhcp_range_for(lan_cidr)
+    state = load_state()
+    reservation_lines = []
+    for mac, client_ip in sorted(state.get("dhcp_reservations", {}).items()):
+        mac = normalize_mac(mac)
+        try:
+            client_ip = normalize_dhcp_reservation_ip(client_ip, lan_cidr)
+        except ValueError:
+            continue
+        if mac and client_ip:
+            reservation_lines.append(f"dhcp-host={mac},{client_ip}")
     DNSMASQ_CONF.write_text(
         "\n".join(
             [
@@ -630,6 +958,7 @@ def write_dnsmasq_conf(lan_if, lan_cidr):
                 "server=8.8.8.8",
                 "domain-needed",
                 "bogus-priv",
+                *reservation_lines,
                 f"dhcp-leasefile={DNSMASQ_LEASES}",
                 f"pid-file={DNSMASQ_PID}",
                 "log-dhcp",
@@ -703,39 +1032,57 @@ def clear_lan_addresses(ifname, lan_cidr):
 
 def ensure_lan_bridge(base_lan_if, wifi_if, bridge_if, lan_cidr):
     require_commands(["ip"])
-    require_interface(base_lan_if, "LAN")
-    require_interface(wifi_if, "WiFi")
+    lan_members = interface_list(base_lan_if)
+    if not lan_members:
+        raise RuntimeError("Chua cau hinh LAN interface")
+    for member in lan_members:
+        require_interface(member, "LAN")
+    if wifi_if:
+        require_interface(wifi_if, "WiFi")
     if not interface_exists(bridge_if):
         sudo(["ip", "link", "add", "name", bridge_if, "type", "bridge"])
-        sudo(["ip", "link", "set", "dev", bridge_if, "type", "bridge", "stp_state", "0"], check=False)
-    clear_lan_addresses(base_lan_if, lan_cidr)
-    clear_lan_addresses(wifi_if, lan_cidr)
-    sudo(["ip", "link", "set", "dev", base_lan_if, "nomaster"], check=False)
-    sudo(["ip", "link", "set", "dev", base_lan_if, "master", bridge_if])
-    sudo(["ip", "link", "set", "dev", base_lan_if, "up"])
+    set_networkd_unmanaged([bridge_if, *lan_members, wifi_if], True)
+    sudo(["ip", "link", "set", "dev", bridge_if, "type", "bridge", "stp_state", "0"], check=False)
+    sudo(["ip", "link", "set", "dev", bridge_if, "type", "bridge", "forward_delay", "0"], check=False)
+    for member in lan_members:
+        set_nm_managed(member, False)
+        clear_lan_addresses(member, lan_cidr)
+        sudo(["ip", "link", "set", "dev", member, "nomaster"], check=False)
+        sudo(["ip", "link", "set", "dev", member, "master", bridge_if])
+        sudo(["ip", "link", "set", "dev", member, "up"])
+    if wifi_if:
+        set_nm_managed(wifi_if, False)
+        clear_lan_addresses(wifi_if, lan_cidr)
     sudo(["ip", "link", "set", "dev", bridge_if, "up"])
 
 
-def teardown_lan_bridge(base_lan_if, bridge_if):
-    if base_lan_if and interface_exists(base_lan_if):
-        sudo(["ip", "link", "set", "dev", base_lan_if, "nomaster"], check=False)
+def teardown_lan_bridge(base_lan_if, bridge_if, wifi_if=""):
+    networkd_ifnames = [bridge_if, *interface_list(base_lan_if), wifi_if]
+    for member in interface_list(base_lan_if):
+        if interface_exists(member):
+            sudo(["ip", "link", "set", "dev", member, "nomaster"], check=False)
+            set_nm_managed(member, True)
+    if wifi_if and interface_exists(wifi_if):
+        set_nm_managed(wifi_if, True)
     if interface_exists(bridge_if):
         sudo(["ip", "link", "set", "dev", bridge_if, "down"], check=False)
         sudo(["ip", "link", "del", "dev", bridge_if], check=False)
+    set_networkd_unmanaged(networkd_ifnames, False)
 
 
 def apply_router_stack(wan_if, base_lan_if, lan_cidr):
     state = load_state()
     hotspot = normalized_hotspot(state)
     lan_if = active_lan_if(base_lan_if, state)
-    stale_lan_ifs = [base_lan_if]
+    bridge_wifi_if = hotspot["ifname"] if hotspot["enabled"] else ""
+    stale_lan_ifs = interface_list(base_lan_if)
     if hotspot["ifname"]:
         stale_lan_ifs.append(hotspot["ifname"])
     if lan_if == DEFAULT_BRIDGE_IF:
-        ensure_lan_bridge(base_lan_if, hotspot["ifname"], lan_if, lan_cidr)
+        ensure_lan_bridge(base_lan_if, bridge_wifi_if, lan_if, lan_cidr)
     else:
         stop_hotspot(hotspot)
-        teardown_lan_bridge(base_lan_if, DEFAULT_BRIDGE_IF)
+        teardown_lan_bridge(base_lan_if, DEFAULT_BRIDGE_IF, hotspot.get("ifname", ""))
     for stale_if in dict.fromkeys(stale_lan_ifs):
         if stale_if and stale_if != lan_if:
             remove_router_rules(wan_if, stale_if)
@@ -748,7 +1095,7 @@ def apply_router_stack(wan_if, base_lan_if, lan_cidr):
     return lan_if
 
 
-def stop_router(wan_if, lan_if):
+def stop_router(wan_if, lan_if, base_lan_if=""):
     stop_hotspot()
     remove_router_rules(wan_if, lan_if)
     stop_pid(REDSOCKS_PID)
@@ -756,11 +1103,79 @@ def stop_router(wan_if, lan_if):
     stop_domain_proxy_workers()
     stop_pid(DNSMASQ_PID)
     if lan_if == DEFAULT_BRIDGE_IF:
-        teardown_lan_bridge("", DEFAULT_BRIDGE_IF)
+        state = load_state()
+        hotspot = normalized_hotspot(state)
+        teardown_lan_bridge(base_lan_if, DEFAULT_BRIDGE_IF, hotspot.get("ifname", ""))
 
 
 def normalize_mac(mac):
     return str(mac or "").strip().lower()
+
+
+def remove_dnsmasq_leases_for_mac(mac):
+    mac = normalize_mac(mac)
+    if not mac or not DNSMASQ_LEASES.exists():
+        return []
+    lines = DNSMASQ_LEASES.read_text().splitlines()
+    kept = []
+    removed_ips = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 3 and normalize_mac(parts[1]) == mac:
+            removed_ips.append(parts[2])
+            continue
+        kept.append(line)
+    if removed_ips:
+        text = "\n".join(kept)
+        if text:
+            text += "\n"
+        sudo_write_text(DNSMASQ_LEASES, text)
+    return removed_ips
+
+
+def flush_client_network_state(lan_if, ips):
+    if not lan_if:
+        return
+    clean_ips = []
+    for ip in ips:
+        try:
+            parsed = ipaddress.ip_address(ip)
+        except (TypeError, ValueError):
+            continue
+        if parsed.version == 4:
+            clean_ips.append(str(parsed))
+    if not clean_ips:
+        return
+    flush_client_conntrack(clean_ips)
+    for ip in sorted(set(clean_ips), key=ip_sort_key):
+        sudo(["ip", "neigh", "del", ip, "dev", lan_if], check=False)
+
+
+def disconnect_wifi_client(mac, wifi_if):
+    mac = normalize_mac(mac)
+    if not mac or not wifi_if:
+        return False
+    if shutil.which("iw") and mac not in wifi_station_details(wifi_if):
+        return False
+    if shutil.which("iw") and sudo_success(["iw", "dev", wifi_if, "station", "del", mac]):
+        return True
+    if shutil.which("hostapd_cli"):
+        return sudo_success(["hostapd_cli", "-i", wifi_if, "deauthenticate", mac])
+    return False
+
+
+def refresh_dhcp_client(mac, lan_if, candidate_ips=None):
+    mac = normalize_mac(mac)
+    state = load_state()
+    hotspot = normalized_hotspot(state)
+    reservation_ip = state.get("dhcp_reservations", {}).get(mac, "")
+    ips = set(candidate_ips or [])
+    if reservation_ip:
+        ips.add(reservation_ip)
+    flush_client_network_state(lan_if, ips)
+    if disconnect_wifi_client(mac, hotspot.get("ifname", "")):
+        return "DHCP binding changed; lease cleared and WiFi client reconnected to get the new IP"
+    return "DHCP binding changed; lease cleared. Client will get the new IP on next reconnect/renew"
 
 
 def wifi_station_details(wifi_if):
@@ -806,10 +1221,96 @@ def bridge_fdb_ports(bridge_if):
     return ports
 
 
+def timestamp_now():
+    return int(time.time())
+
+
+def format_timestamp(value):
+    try:
+        ts = int(float(value))
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def device_presence_key(row):
+    mac = normalize_mac(row.get("mac", ""))
+    return mac or str(row.get("ip", "")).strip()
+
+
+def row_is_online(row, wifi_stations, fdb_ports):
+    mac = normalize_mac(row.get("mac", ""))
+    if mac and mac in wifi_stations:
+        return True, "wifi station"
+    if mac and mac in fdb_ports:
+        return True, "bridge fdb"
+    states = {str(item).upper() for item in row.get("neigh_state", [])}
+    if states & ONLINE_NEIGH_STATES:
+        return True, "/".join(sorted(states))
+    if states & OFFLINE_NEIGH_STATES:
+        return False, "/".join(sorted(states))
+    return False, "/".join(sorted(states)) or row.get("source", "unknown")
+
+
+def update_device_presence(state, rows, wifi_stations, fdb_ports):
+    presence = state.setdefault("device_presence", {})
+    now = timestamp_now()
+    changed = False
+    for row in rows:
+        key = device_presence_key(row)
+        if not key:
+            continue
+        online, reason = row_is_online(row, wifi_stations, fdb_ports)
+        entry = presence.get(key, {})
+        if not isinstance(entry, dict):
+            entry = {}
+        was_online = bool(entry.get("online", False))
+        if online:
+            updates = {
+                "online": True,
+                "ip": row.get("ip", ""),
+                "mac": normalize_mac(row.get("mac", "")),
+                "hostname": row.get("hostname", ""),
+                "connection": row.get("connection", ""),
+                "interface": row.get("interface", ""),
+                "first_seen": entry.get("first_seen") or now,
+                "last_seen": now,
+                "disconnected_at": "",
+                "reason": reason,
+            }
+        else:
+            disconnected_at = entry.get("disconnected_at") or (now if was_online or not entry else "")
+            updates = {
+                "online": False,
+                "ip": row.get("ip", entry.get("ip", "")),
+                "mac": normalize_mac(row.get("mac", entry.get("mac", ""))),
+                "hostname": row.get("hostname", entry.get("hostname", "")),
+                "connection": row.get("connection", entry.get("connection", "")),
+                "interface": row.get("interface", entry.get("interface", "")),
+                "first_seen": entry.get("first_seen") or now,
+                "last_seen": entry.get("last_seen") or "",
+                "disconnected_at": disconnected_at,
+                "reason": reason,
+            }
+        if entry != updates:
+            presence[key] = updates
+            changed = True
+        row["online"] = online
+        row["presence_reason"] = reason
+        row["last_seen_at"] = presence[key].get("last_seen", "")
+        row["disconnected_at"] = presence[key].get("disconnected_at", "")
+        row["last_seen_text"] = format_timestamp(row["last_seen_at"])
+        row["disconnected_text"] = format_timestamp(row["disconnected_at"])
+    return changed
+
+
 def classify_client(mac, lan_if, base_lan_if, wifi_if, wifi_stations=None, fdb_ports=None):
     mac = normalize_mac(mac)
     wifi_stations = wifi_stations or {}
     fdb_ports = fdb_ports or {}
+    lan_members = interface_list(base_lan_if)
     if mac and mac in wifi_stations:
         station = wifi_stations[mac]
         detail = station.get("signal", "")
@@ -817,12 +1318,12 @@ def classify_client(mac, lan_if, base_lan_if, wifi_if, wifi_stations=None, fdb_p
     port = fdb_ports.get(mac, "")
     if port == wifi_if:
         return {"connection": "WiFi", "interface": wifi_if, "detail": ""}
-    if port == base_lan_if:
-        return {"connection": "LAN", "interface": base_lan_if, "detail": ""}
+    if port in lan_members:
+        return {"connection": "LAN", "interface": port, "detail": ""}
     if lan_if == wifi_if:
         return {"connection": "WiFi", "interface": wifi_if, "detail": ""}
-    if lan_if == base_lan_if:
-        return {"connection": "LAN", "interface": base_lan_if, "detail": ""}
+    if lan_if in lan_members:
+        return {"connection": "LAN", "interface": lan_if, "detail": ""}
     return {"connection": "Unknown", "interface": port or lan_if, "detail": ""}
 
 
@@ -862,10 +1363,14 @@ def list_leases(lan_if, lan_cidr, base_lan_if="", wifi_if=""):
             continue
         if row.get("dev") != lan_if or ipaddress.ip_address(ip) not in lan_net:
             continue
+        neigh_state = row.get("state", [])
+        if isinstance(neigh_state, str):
+            neigh_state = [neigh_state]
         if ip not in leases:
             leases[ip] = {"ip": ip, "mac": lladdr, "hostname": "", "expires": "", "source": "arp"}
         elif lladdr and not leases[ip].get("mac"):
             leases[ip]["mac"] = lladdr
+        leases[ip]["neigh_state"] = neigh_state
     rows = [
         annotate_client(row, lan_if, base_lan_if, wifi_if, wifi_stations, fdb_ports)
         for row in leases.values()
@@ -887,6 +1392,7 @@ def interface_kind(ifname):
 
 def network_cards(wan_if, base_lan_if, active_if, hotspot):
     addr_rows = json.loads(sh(["ip", "-j", "addr"], check=False) or "[]")
+    lan_members = interface_list(base_lan_if)
     rows = []
     for row in addr_rows:
         ifname = row.get("ifname", "")
@@ -895,7 +1401,7 @@ def network_cards(wan_if, base_lan_if, active_if, hotspot):
         roles = []
         if ifname == wan_if:
             roles.append("WAN")
-        if ifname == base_lan_if:
+        if ifname in lan_members:
             roles.append("LAN port")
         if ifname == active_if:
             roles.append("Gateway")
@@ -1525,6 +2031,26 @@ def iptables_proxy_reset(lan_if):
                 "icmp-port-unreachable",
             ]
         )
+        for ports in UDP_GUARD_PORTS:
+            delete_existing_rule(
+                [
+                    "iptables",
+                    "-D",
+                    "FORWARD",
+                    "-s",
+                    client_ip,
+                    "-p",
+                    "udp",
+                    "-m",
+                    "udp",
+                    "--dport",
+                    ports,
+                    "-j",
+                    "REJECT",
+                    "--reject-with",
+                    "icmp-port-unreachable",
+                ]
+            )
         delete_existing_rule(
             [
                 "iptables",
@@ -1746,22 +2272,27 @@ def apply_proxy_rules(lan_if):
                 "icmp-port-unreachable",
             ]
         )
-        sudo(
-            [
-                "iptables",
-                "-I",
-                "FORWARD",
-                "1",
-                "-s",
-                client_ip,
-                "-p",
-                "udp",
-                "-j",
-                "REJECT",
-                "--reject-with",
-                "icmp-port-unreachable",
-            ]
-        )
+        for ports in UDP_GUARD_PORTS:
+            sudo(
+                [
+                    "iptables",
+                    "-I",
+                    "FORWARD",
+                    "1",
+                    "-s",
+                    client_ip,
+                    "-p",
+                    "udp",
+                    "-m",
+                    "udp",
+                    "--dport",
+                    ports,
+                    "-j",
+                    "REJECT",
+                    "--reject-with",
+                    "icmp-port-unreachable",
+                ]
+            )
         sudo(
             [
                 "iptables",
@@ -1809,6 +2340,23 @@ def command_status(wan_if, lan_if):
     hotspot = normalized_hotspot(state)
     lan_if = active_lan_if(base_lan_if, state)
     lan_ip, _, lan_network = cidr_parts(lan_cidr)
+    wifi_stations = wifi_station_details(hotspot.get("ifname", ""))
+    fdb_ports = bridge_fdb_ports(lan_if if lan_if == DEFAULT_BRIDGE_IF else "")
+    leases = list_leases(lan_if, lan_cidr, base_lan_if, hotspot.get("ifname", ""))
+    changed = update_device_presence(state, leases, wifi_stations, fdb_ports)
+    hidden = state.setdefault("hidden_offline_devices", {})
+    for row in leases:
+        key = device_presence_key(row)
+        if key and row.get("online") and key in hidden:
+            hidden.pop(key, None)
+            changed = True
+    visible_leases = [
+        row
+        for row in leases
+        if not (device_presence_key(row) in hidden and not row.get("online"))
+    ]
+    if changed:
+        save_state(state)
     return {
         "wan_if": wan_if,
         "base_lan_if": base_lan_if,
@@ -1824,18 +2372,22 @@ def command_status(wan_if, lan_if):
         "dnsmasq": pid_alive(DNSMASQ_PID),
         "hostapd": pid_alive(HOSTAPD_PID),
         "redsocks": pid_alive(REDSOCKS_PID),
-        "leases": list_leases(lan_if, lan_cidr, base_lan_if, hotspot.get("ifname", "")),
+        "leases": visible_leases,
         "network_cards": network_cards(wan_if, base_lan_if, lan_if, hotspot),
-        "wifi_stations": list(wifi_station_details(hotspot.get("ifname", "")).values()),
+        "wifi_stations": list(wifi_stations.values()),
         "wifi_interfaces": wireless_interfaces(),
         "state": public_state(state),
     }
 
 
-def render_page(data, message="", proxy_check=None):
+def render_page(data, message="", proxy_check=None, device_filter="online", device_sort="ip", sort_dir="asc"):
     state = data["state"]
     proxies = state.get("proxies", [])
     assignments = state.get("assignments", {})
+    device_names = state.get("device_names", {})
+    dhcp_reservations = state.get("dhcp_reservations", {})
+    lan_cidr = state.get("lan_cidr", DEFAULT_LAN_CIDR)
+    device_presence = state.get("device_presence", {})
     hotspot = normalized_hotspot(state)
     load_balance = load_balance_config(state)
     wifi_names = list(data.get("wifi_interfaces", []))
@@ -1846,6 +2398,10 @@ def render_page(data, message="", proxy_check=None):
     hotspot_running = bool(data.get("hostapd"))
     hotspot_label = "Running" if hotspot_running else ("Configured" if hotspot["enabled"] else "Off")
     hotspot_password_placeholder = "configured" if hotspot.get("password") else "8-63 chars"
+    band_options = []
+    for value, label in (("2.4", "2.4 GHz"), ("5", "5 GHz fast")):
+        selected = " selected" if hotspot["band"] == value else ""
+        band_options.append(f'<option value="{value}"{selected}>{label}</option>')
     leases = {lease["ip"]: lease for lease in data["leases"]}
     for assigned_ip in assignments:
         leases.setdefault(
@@ -1859,9 +2415,107 @@ def render_page(data, message="", proxy_check=None):
                 "connection": "Unknown",
                 "interface": data["lan_if"],
                 "detail": "",
+                "online": False,
+                "presence_reason": "manual",
+                "last_seen_text": "",
+                "disconnected_text": format_timestamp(device_presence.get(assigned_ip, {}).get("disconnected_at")),
             },
         )
     leases = [leases[ip] for ip in sorted(leases, key=lambda value: tuple(int(p) for p in value.split(".")))]
+    online_count = sum(1 for lease in leases if lease.get("online"))
+    offline_count = len(leases) - online_count
+    device_filter = device_filter if device_filter in {"online", "offline"} else "online"
+    sort_columns = {
+        "ip": "IP",
+        "name": "Name",
+        "mac": "MAC",
+        "hostname": "Hostname",
+        "connection": "Connection",
+        "status": "Status",
+        "proxy": "Proxy",
+    }
+    device_sort = device_sort if device_sort in sort_columns else "ip"
+    sort_dir = sort_dir if sort_dir in {"asc", "desc"} else "asc"
+
+    def ip_sort_value(value):
+        try:
+            addr = ipaddress.ip_address(value)
+            return (addr.version, int(addr))
+        except ValueError:
+            return (99, str(value))
+
+    def assigned_proxy_label(lease):
+        current = assignments.get(lease.get("ip", ""), "")
+        if current == "":
+            return "direct/nat"
+        try:
+            idx = int(current)
+        except (TypeError, ValueError):
+            return str(current).lower()
+        if 0 <= idx < len(proxies):
+            return proxy_key(proxies[idx]).lower()
+        return str(current).lower()
+
+    def device_name(lease):
+        mac = normalize_mac(lease.get("mac", ""))
+        return str(device_names.get(mac, "")).strip()
+
+    def device_sort_value(lease):
+        if device_sort == "ip":
+            return ip_sort_value(lease.get("ip", ""))
+        if device_sort == "name":
+            return device_name(lease).lower()
+        if device_sort == "mac":
+            return lease.get("mac", "").lower()
+        if device_sort == "hostname":
+            return lease.get("hostname", "").lower()
+        if device_sort == "connection":
+            return (
+                lease.get("connection", "").lower(),
+                lease.get("interface", "").lower(),
+                lease.get("detail", "").lower(),
+            )
+        if device_sort == "status":
+            return (
+                0 if lease.get("online") else 1,
+                lease.get("last_seen_text", "") if lease.get("online") else lease.get("disconnected_text", ""),
+            )
+        if device_sort == "proxy":
+            return assigned_proxy_label(lease)
+        return ip_sort_value(lease.get("ip", ""))
+
+    filtered_leases = [
+        lease
+        for lease in leases
+        if bool(lease.get("online")) == (device_filter == "online")
+    ]
+    filtered_leases = sorted(
+        filtered_leases,
+        key=lambda lease: (device_sort_value(lease), ip_sort_value(lease.get("ip", ""))),
+        reverse=sort_dir == "desc",
+    )
+    device_empty_text = (
+        "Chua co thiet bi online."
+        if device_filter == "online"
+        else "Chua co thiet bi offline."
+    )
+    tab_sort_query = f"&sort={quote(device_sort)}&dir={quote(sort_dir)}"
+    device_tabs = f"""
+        <div class="device-tabs">
+          <a data-device-nav="1" class="{ 'active' if device_filter == 'online' else '' }" href="/?devices=online{tab_sort_query}">Online <span>{online_count}</span></a>
+          <a data-device-nav="1" class="{ 'active' if device_filter == 'offline' else '' }" href="/?devices=offline{tab_sort_query}">Offline <span>{offline_count}</span></a>
+        </div>
+    """
+    device_headers = []
+    for key, label in sort_columns.items():
+        next_dir = "desc" if device_sort == key and sort_dir == "asc" else "asc"
+        marker = "^" if device_sort == key and sort_dir == "asc" else ("v" if device_sort == key else "")
+        active_class = " active" if device_sort == key else ""
+        device_headers.append(
+            f'<th><a data-device-nav="1" class="sort-link{active_class}" href="/?devices={quote(device_filter)}&sort={quote(key)}&dir={quote(next_dir)}">'
+            f'{html.escape(label)}<span>{marker}</span></a></th>'
+        )
+    device_headers.append("<th>Action</th>")
     card_rows = []
     for card in data.get("network_cards", []):
         addresses = ", ".join(card.get("addresses", [])) or "-"
@@ -1883,7 +2537,7 @@ def render_page(data, message="", proxy_check=None):
             f"<option value='{idx}'>{html.escape(proxy_key(proxy))} -> localhost:{proxy_port(idx)}</option>"
         )
     device_rows = []
-    for lease in leases:
+    for lease in filtered_leases:
         ip = lease["ip"]
         current = assignments.get(ip, "")
         options = []
@@ -1895,21 +2549,51 @@ def render_page(data, message="", proxy_check=None):
             else:
                 options.append(opt)
         connection_detail = " ".join(filter(None, [lease.get("interface", ""), lease.get("detail", "")]))
+        mac = normalize_mac(lease.get("mac", ""))
+        name_value = device_name(lease)
+        dhcp_ip = dhcp_reservations.get(mac, "")
+        binding_ip = dhcp_ip or ip
+        name_display = name_value or "-"
+        online = bool(lease.get("online"))
+        status_class = "status-online" if online else "status-offline"
+        status_label = "Online" if online else "Offline"
+        status_time = lease.get("last_seen_text", "") if online else lease.get("disconnected_text", "")
+        status_time_label = "Last seen" if online else "Disconnected"
+        status_detail = " ".join(filter(None, [status_time_label if status_time else "", status_time]))
+        status_reason = lease.get("presence_reason", "")
         device_rows.append(
             f"""
-            <tr>
-              <td><strong>{html.escape(ip)}</strong><span>{html.escape(lease.get('source',''))}</span></td>
-              <td>{html.escape(lease.get('mac',''))}</td>
+	            <tr>
+	              <td><strong>{html.escape(ip)}</strong><span>{html.escape(lease.get('source',''))}</span></td>
+	              <td><strong>{html.escape(name_display)}</strong>{f'<span>DHCP {html.escape(dhcp_ip)}</span>' if dhcp_ip else ''}</td>
+	              <td>{html.escape(lease.get('mac',''))}</td>
               <td>{html.escape(lease.get('hostname',''))}</td>
               <td><strong>{html.escape(lease.get('connection','Unknown'))}</strong><span>{html.escape(connection_detail)}</span></td>
               <td>
-                <form method="post" action="/assign">
-                  <input type="hidden" name="ip" value="{html.escape(ip)}">
-                  <select name="proxy">{''.join(options)}</select>
-                  <button>Save</button>
-                </form>
+                <span class="status-badge {status_class}"><span class="status-dot"></span>{html.escape(status_label)}</span>
+                <span>{html.escape(status_detail or status_reason)}</span>
               </td>
-            </tr>
+	              <td>
+	                <form method="post" action="/assign">
+	                  <input type="hidden" name="ip" value="{html.escape(ip)}">
+	                  <select name="proxy">{''.join(options)}</select>
+	                  <button>Save</button>
+	                </form>
+	              </td>
+	              <td>
+	                <button
+	                  type="button"
+	                  class="neutral"
+	                  data-device-edit
+	                  data-mac="{html.escape(mac)}"
+	                  data-name="{html.escape(name_value)}"
+	                  data-dhcp="{html.escape(dhcp_ip)}"
+	                  data-binding-ip="{html.escape(binding_ip)}"
+	                  data-ip="{html.escape(ip)}"
+	                  {'disabled' if not mac else ''}
+	                >Edit</button>
+	              </td>
+	            </tr>
             """
         )
     proxy_rows = []
@@ -2020,7 +2704,112 @@ def render_page(data, message="", proxy_check=None):
     th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }}
     th {{ color: var(--muted); font-size: 13px; font-weight: 700; }}
     td span {{ display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }}
-    form {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0; }}
+    .status-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 26px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 800;
+      margin-top: 0;
+    }}
+    .status-dot {{
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      margin-top: 0;
+      background: currentColor;
+    }}
+	    .status-online {{ color: #047857; background: #d1fae5; }}
+	    .status-offline {{ color: #b91c1c; background: #fee2e2; }}
+	    .device-tabs {{
+	      display: inline-flex;
+	      align-items: center;
+	      gap: 4px;
+	      padding: 4px;
+	      margin-bottom: 12px;
+	      border: 1px solid var(--line);
+	      border-radius: 8px;
+	      background: var(--soft);
+	    }}
+	    .device-tabs a {{
+	      display: inline-flex;
+	      align-items: center;
+	      gap: 7px;
+	      min-height: 34px;
+	      padding: 7px 12px;
+	      border-radius: 6px;
+	      color: var(--muted);
+	      font-size: 13px;
+	      font-weight: 800;
+	    }}
+	    .device-tabs a.active {{
+	      color: white;
+	      background: var(--accent);
+	    }}
+	    .device-tabs span {{
+	      margin: 0;
+	      color: inherit;
+	      font-size: 12px;
+	      font-weight: 800;
+	    }}
+	    .sort-link {{
+	      display: inline-flex;
+	      align-items: center;
+	      gap: 6px;
+	      color: var(--muted);
+	      font-weight: 800;
+	    }}
+	    .sort-link.active {{
+	      color: var(--ink);
+	    }}
+	    .sort-link span {{
+	      min-width: 10px;
+	      margin: 0;
+	      color: inherit;
+	      font-size: 11px;
+	      line-height: 1;
+	    }}
+	    .socket-status {{
+	      align-self: center;
+	      min-height: 26px;
+	      padding: 5px 9px;
+	      border-radius: 999px;
+	      background: #fee2e2;
+	      color: #991b1b;
+	      font-size: 12px;
+	      font-weight: 800;
+	    }}
+	    .socket-status.live {{
+	      background: #d1fae5;
+	      color: #047857;
+	    }}
+	    form {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0; }}
+	    .modal {{
+	      position: fixed;
+	      inset: 0;
+	      z-index: 20;
+	      display: grid;
+	      place-items: center;
+	      padding: 18px;
+	      background: rgba(15, 23, 42, 0.38);
+	    }}
+	    .modal[hidden] {{ display: none; }}
+	    .modal-panel {{
+	      width: min(100%, 460px);
+	      background: var(--panel);
+	      border: 1px solid var(--line);
+	      border-radius: 8px;
+	      padding: 18px;
+	      box-shadow: 0 22px 48px rgba(15, 23, 42, 0.22);
+	    }}
+	    .modal-panel h3 {{ margin: 0 0 14px; font-size: 17px; }}
+	    .modal-panel form {{ display: grid; gap: 12px; }}
+	    .modal-panel label {{ display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 800; }}
+	    .modal-panel input {{ width: 100%; min-width: 0; }}
+	    .modal-actions {{ display: flex; gap: 8px; justify-content: flex-end; }}
     input, select {{
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -2041,12 +2830,12 @@ def render_page(data, message="", proxy_check=None):
     .proxy-form input, .proxy-form select {{ width: 100%; min-width: 0; }}
     .hotspot-form {{
       display: grid;
-      grid-template-columns: minmax(130px, 170px) minmax(180px, 1fr) minmax(170px, 1fr) minmax(90px, 120px) auto;
+      grid-template-columns: minmax(130px, 170px) minmax(110px, 130px) minmax(180px, 1fr) minmax(170px, 1fr) minmax(80px, 100px) minmax(90px, 120px) auto;
       gap: 8px;
       align-items: end;
     }}
     .hotspot-form label {{ display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }}
-    .hotspot-form input {{ width: 100%; min-width: 0; }}
+    .hotspot-form input, .hotspot-form select {{ width: 100%; min-width: 0; }}
     .url-form {{ margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--line); }}
     button {{
       border: 0;
@@ -2058,9 +2847,18 @@ def render_page(data, message="", proxy_check=None):
       font-weight: 700;
       cursor: pointer;
     }}
-    button.primary {{ background: var(--accent); }}
-    button.danger {{ background: var(--danger); }}
-    button.neutral {{ background: #4b5563; }}
+	    button.primary {{ background: var(--accent); }}
+	    button.danger {{ background: var(--danger); }}
+	    button.neutral {{ background: #4b5563; }}
+	    input:disabled, select:disabled {{
+	      color: var(--muted);
+	      background: #f8fafc;
+	      cursor: not-allowed;
+	    }}
+	    button:disabled {{
+	      opacity: 0.45;
+	      cursor: not-allowed;
+	    }}
     pre {{
       overflow: auto;
       padding: 12px;
@@ -2091,12 +2889,13 @@ def render_page(data, message="", proxy_check=None):
     <div>
       <h1>Ubuntu Router Manager</h1>
       <div>WAN: <strong>{html.escape(data['wan_if'])}</strong> | LAN out: <strong>{html.escape(data['lan_if'])}</strong> | Gateway: <strong>{html.escape(data['lan_ip'])}</strong></div>
-    </div>
-    <div class="actions">
-      <form method="get" action="/"><button class="neutral">Refresh</button></form>
-      <a href="/api/status">JSON</a>
-      <a href="/logout">Logout</a>
-    </div>
+	    </div>
+	    <div class="actions">
+	      <button type="button" class="neutral" data-refresh-status>Refresh</button>
+	      <span class="socket-status" data-socket-status>Offline</span>
+	      <a href="/api/status">JSON</a>
+	      <a href="/logout">Logout</a>
+	    </div>
   </header>
   <main>
     {f'<div class="msg">{html.escape(message)}</div>' if message else ''}
@@ -2107,15 +2906,20 @@ def render_page(data, message="", proxy_check=None):
         <div class="metric"><b>WiFi Hotspot</b><span class="{ 'ok' if hotspot_running else 'bad' }">{html.escape(hotspot_label)}</span></div>
         <div class="metric"><b>IP Forward</b><span class="{ 'ok' if data['ip_forward'] == '1' else 'bad' }">{html.escape(data['ip_forward'])}</span></div>
         <div class="metric"><b>Proxy Engine</b><span class="{ 'ok' if data['redsocks'] else 'bad' }">{'Running' if data['redsocks'] else 'Stopped'}</span></div>
+        <div class="metric"><b>LAN CIDR</b><span>{html.escape(lan_cidr)}</span></div>
         <div class="metric"><b>DHCP Range</b><span>{html.escape(data['dhcp_range'][0])} - {html.escape(data['dhcp_range'][1])}</span></div>
         <div class="metric"><b>WAN MAC</b><span>{html.escape(data['wan_mac'])}</span></div>
         <div class="metric"><b>LAN MAC</b><span>{html.escape(data['lan_mac'])}</span></div>
-        <div class="metric"><b>DNS/WebRTC Guard</b><span class="ok">Strict</span></div>
+	        <div class="metric"><b>DNS/WebRTC Guard</b><span class="ok">Enabled</span></div>
         <div class="metric"><b>LAN Isolation</b><span class="ok">Enabled</span></div>
       </div>
-      <div class="actions" style="margin-top:14px">
-        <form method="post" action="/setup"><button class="primary">Apply LAN Router Config</button></form>
-        <form method="post" action="/mac/rotate">
+	      <div class="actions" style="margin-top:14px">
+	        <form method="post" action="/setup"><button class="primary">Apply LAN Router Config</button></form>
+	        <form method="post" action="/lan/save">
+	          <input type="text" name="lan_cidr" value="{html.escape(lan_cidr)}" placeholder="10.42.7.1/24 or 10.42.0.1/16">
+	          <button class="neutral">Save LAN CIDR</button>
+	        </form>
+	        <form method="post" action="/mac/rotate">
           <input type="hidden" name="target" value="wan">
           <button class="neutral">Rotate WAN MAC</button>
         </form>
@@ -2131,7 +2935,9 @@ def render_page(data, message="", proxy_check=None):
       <div class="grid">
         <div class="metric"><b>Interface</b><span>{html.escape(hotspot['ifname'] or selected_wifi or 'none')}</span></div>
         <div class="metric"><b>SSID</b><span>{html.escape(hotspot['ssid'])}</span></div>
+        <div class="metric"><b>Band</b><span>{html.escape(wifi_band_label(hotspot['band']))}</span></div>
         <div class="metric"><b>Channel</b><span>{html.escape(str(hotspot['channel']))}</span></div>
+        <div class="metric"><b>Country</b><span>{html.escape(hotspot['country'])}</span></div>
         <div class="metric"><b>LAN Output</b><span>{html.escape(data['lan_if'])}</span></div>
       </div>
       <form method="post" action="/hotspot/save" style="margin-top:14px">
@@ -2140,14 +2946,20 @@ def render_page(data, message="", proxy_check=None):
             <input type="text" name="ifname" list="wifi-ifaces" value="{html.escape(selected_wifi)}" placeholder="wlan0">
             <datalist id="wifi-ifaces">{wifi_options}</datalist>
           </label>
+          <label>Band
+            <select name="band">{''.join(band_options)}</select>
+          </label>
           <label>Ten WiFi
             <input type="text" name="ssid" maxlength="32" value="{html.escape(hotspot['ssid'])}" placeholder="RouterWiFi">
           </label>
           <label>Password
             <input type="password" name="password" autocomplete="new-password" placeholder="{html.escape(hotspot_password_placeholder)}">
           </label>
+          <label>Country
+            <input type="text" name="country" maxlength="2" value="{html.escape(hotspot['country'])}">
+          </label>
           <label>Channel
-            <input type="number" name="channel" min="1" max="13" value="{html.escape(str(hotspot['channel']))}">
+            <input type="number" name="channel" min="1" max="161" value="{html.escape(str(hotspot['channel']))}">
           </label>
           <button class="primary">Start Hotspot</button>
         </div>
@@ -2163,18 +2975,19 @@ def render_page(data, message="", proxy_check=None):
         <tbody>{''.join(card_rows) if card_rows else '<tr><td colspan="5">Khong doc duoc card mang.</td></tr>'}</tbody>
       </table>
     </section>
-    <section>
-      <h2>Devices</h2>
-      <table>
-        <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Connection</th><th>Proxy</th></tr></thead>
-        <tbody>{''.join(device_rows) if device_rows else '<tr><td colspan="5">Chua thay thiet bi nao. Ket noi thiet bi vao LAN/WiFi roi cho 5-10 giay.</td></tr>'}</tbody>
-      </table>
-      <form method="post" action="/assign" style="margin-top:14px">
-        <input type="text" name="ip" placeholder="Gan thu cong IP, vi du 10.42.0.50">
-        <select name="proxy">{''.join(assign_options)}</select>
-        <button>Assign IP</button>
-      </form>
-    </section>
+	    <section>
+	      <h2>Devices</h2>
+	      {device_tabs}
+	      <table>
+	        <thead><tr>{''.join(device_headers)}</tr></thead>
+	        <tbody>{''.join(device_rows) if device_rows else f'<tr><td colspan="8">{device_empty_text}</td></tr>'}</tbody>
+	      </table>
+		      <form method="post" action="/assign" style="margin-top:14px">
+		        <input type="text" name="ip" placeholder="Gan thu cong IP, vi du 10.42.0.50">
+		        <select name="proxy">{''.join(assign_options)}</select>
+		        <button>Assign IP</button>
+		      </form>
+		    </section>
     <section>
       <h2>Load Balance</h2>
       <div class="grid">
@@ -2249,14 +3062,175 @@ def render_page(data, message="", proxy_check=None):
         <tbody>{''.join(proxy_rows) if proxy_rows else '<tr><td colspan="6">Chua co proxy. Thiet bi hien dang di Direct/NAT.</td></tr>'}</tbody>
       </table>
     </section>
-    <section>
-      <h2>System</h2>
-      <pre>{html.escape(data['interfaces'])}</pre>
-      <pre>{html.escape(data['routes'])}</pre>
-    </section>
-  </main>
-</body>
-</html>"""
+	    <section>
+	      <h2>System</h2>
+	      <pre>{html.escape(data['interfaces'])}</pre>
+	      <pre>{html.escape(data['routes'])}</pre>
+	    </section>
+	  </main>
+	  <div class="modal" data-device-modal hidden>
+	    <div class="modal-panel">
+	      <h3>DHCP Binding</h3>
+	      <form method="post" action="/device/edit">
+	        <input type="hidden" name="mac" data-modal-mac-hidden>
+	        <label>Name
+	          <input type="text" name="name" maxlength="64" data-modal-name placeholder="Name">
+	        </label>
+	        <label>MAC Address
+	          <input type="text" data-modal-mac readonly>
+	        </label>
+	        <label>IP Address
+	          <input type="text" name="ip_address" data-modal-ip-address placeholder="Vi du 10.42.0.56">
+	        </label>
+	        <div class="modal-actions">
+	          <button type="button" class="neutral" data-modal-close>Cancel</button>
+	          <button>Apply</button>
+	        </div>
+	      </form>
+	    </div>
+	  </div>
+	  <script>
+	    (() => {{
+	      let socket = null;
+	      let retryTimer = null;
+	      let pendingHtml = null;
+		      let state = new URLSearchParams(window.location.search);
+		      const socketStatus = () => document.querySelector('[data-socket-status]');
+		      const hasFocusedEditor = () => Boolean(document.querySelector('input:focus, select:focus, textarea:focus'));
+	      const deviceModal = () => document.querySelector('[data-device-modal]');
+	      const closeDeviceModal = () => {{
+	        const modal = deviceModal();
+	        if (modal) modal.hidden = true;
+	      }};
+	      const openDeviceModal = (button) => {{
+	        const modal = deviceModal();
+		        if (!modal) return;
+		        modal.querySelector('[data-modal-mac-hidden]').value = button.dataset.mac || '';
+		        modal.querySelector('[data-modal-mac]').value = button.dataset.mac || '';
+		        modal.querySelector('[data-modal-name]').value = button.dataset.name || '';
+		        modal.querySelector('[data-modal-ip-address]').value = button.dataset.bindingIp || button.dataset.ip || '';
+		        modal.hidden = false;
+		        modal.querySelector('[data-modal-name]').focus();
+	      }};
+		      const applyDashboard = (html) => {{
+		        const main = document.querySelector('main');
+		        if (main) main.outerHTML = html;
+	      }};
+	      const filters = () => ({{
+	        devices: state.get('devices') || 'online',
+	        sort: state.get('sort') || 'ip',
+	        dir: state.get('dir') || 'asc',
+	      }});
+	      const setSocketStatus = (live) => {{
+	        const el = socketStatus();
+	        if (!el) return;
+	        el.textContent = live ? 'Live' : 'Offline';
+	        el.classList.toggle('live', live);
+	      }};
+	      const socketUrl = () => {{
+	        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+	        const params = new URLSearchParams(filters());
+	        return `${{protocol}}//${{window.location.host}}/ws/status?${{params.toString()}}`;
+	      }};
+	      const sendFilters = (force = false) => {{
+	        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+	        socket.send(JSON.stringify({{type: force ? 'refresh' : 'filters', ...filters()}}));
+	      }};
+	      const connect = () => {{
+	        if (retryTimer) clearTimeout(retryTimer);
+	        socket = new WebSocket(socketUrl());
+	        socket.addEventListener('open', () => {{
+	          setSocketStatus(true);
+	          sendFilters(true);
+	        }});
+	        socket.addEventListener('message', (event) => {{
+	          let data = null;
+	          try {{
+	            data = JSON.parse(event.data);
+	          }} catch (_err) {{
+	            return;
+	          }}
+	          if (data.type !== 'dashboard' || !data.html) return;
+	          if (hasFocusedEditor()) {{
+	            pendingHtml = data.html;
+	            return;
+	          }}
+	          pendingHtml = null;
+	          applyDashboard(data.html);
+	        }});
+	        socket.addEventListener('close', () => {{
+	          setSocketStatus(false);
+	          retryTimer = setTimeout(connect, 2000);
+	        }});
+	        socket.addEventListener('error', () => {{
+	          setSocketStatus(false);
+	          socket.close();
+	        }});
+	      }};
+		      document.addEventListener('click', (event) => {{
+		        const nav = event.target.closest('a[data-device-nav]');
+		        if (nav) {{
+		          event.preventDefault();
+		          const url = new URL(nav.href, window.location.href);
+		          state = new URLSearchParams(url.search);
+		          window.history.replaceState(null, '', `${{url.pathname}}?${{state.toString()}}`);
+		          sendFilters(true);
+		          return;
+		        }}
+		        const edit = event.target.closest('[data-device-edit]');
+		        if (edit) {{
+		          event.preventDefault();
+		          openDeviceModal(edit);
+		          return;
+		        }}
+		        const close = event.target.closest('[data-modal-close]');
+		        if (close) {{
+		          event.preventDefault();
+		          closeDeviceModal();
+		          return;
+		        }}
+		        const modal = event.target.closest('[data-device-modal]');
+		        if (modal && event.target === modal) {{
+		          closeDeviceModal();
+		          return;
+		        }}
+		        const refresh = event.target.closest('[data-refresh-status]');
+		        if (refresh) {{
+		          event.preventDefault();
+	          sendFilters(true);
+	        }}
+	      }});
+		      document.addEventListener('focusout', () => {{
+	        setTimeout(() => {{
+	          if (!pendingHtml || hasFocusedEditor()) return;
+	          const html = pendingHtml;
+	          pendingHtml = null;
+	          applyDashboard(html);
+	        }}, 0);
+		      }});
+	      document.addEventListener('keydown', (event) => {{
+	        if (event.key === 'Escape') closeDeviceModal();
+	      }});
+	      window.addEventListener('beforeunload', () => {{
+	        if (socket) socket.close();
+	      }});
+	      connect();
+	    }})();
+	  </script>
+	</body>
+	</html>"""
+
+
+def render_dashboard_fragment(data, device_filter="online", device_sort="ip", sort_dir="asc"):
+    page = render_page(
+        data,
+        device_filter=device_filter,
+        device_sort=device_sort,
+        sort_dir=sort_dir,
+    )
+    start = page.index("<main>")
+    end = page.index("</main>", start) + len("</main>")
+    return page[start:end]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2408,6 +3382,75 @@ class Handler(BaseHTTPRequestHandler):
     def current_lan_if(self):
         return active_lan_if(self.lan_if)
 
+    def current_lan_cidr(self):
+        return load_state().get("lan_cidr", self.lan_cidr or DEFAULT_LAN_CIDR)
+
+    def status_filters(self, query):
+        return {
+            "device_filter": query.get("devices", ["online"])[0],
+            "device_sort": query.get("sort", ["ip"])[0],
+            "sort_dir": query.get("dir", ["asc"])[0],
+        }
+
+    def handle_status_socket(self, parsed):
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.respond("websocket upgrade required", status=400)
+            return
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key:
+            self.respond("missing websocket key", status=400)
+            return
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", websocket_accept_key(key))
+        self.end_headers()
+        self.close_connection = True
+
+        filters = self.status_filters(parse_qs(parsed.query))
+        next_send = 0
+        last_html = ""
+        self.connection.settimeout(0.2)
+        while True:
+            try:
+                message = websocket_read_message(self.connection)
+                force_send = False
+                if message and message.get("type") == "close":
+                    break
+                if message and message.get("type") == "ping":
+                    self.connection.sendall(websocket_frame(message.get("payload", b""), opcode=0xA))
+                if message and message.get("type") == "text":
+                    try:
+                        payload = json.loads(message.get("text", "{}"))
+                    except json.JSONDecodeError:
+                        payload = {}
+                    if payload.get("type") in {"filters", "refresh"}:
+                        filters = {
+                            "device_filter": payload.get("devices", filters["device_filter"]),
+                            "device_sort": payload.get("sort", filters["device_sort"]),
+                            "sort_dir": payload.get("dir", filters["sort_dir"]),
+                        }
+                        force_send = True
+
+                now = time.monotonic()
+                if force_send or now >= next_send:
+                    data = command_status(self.wan_if, self.lan_if)
+                    html_fragment = render_dashboard_fragment(data, **filters)
+                    if force_send or html_fragment != last_html:
+                        websocket_send_json(
+                            self.connection,
+                            {
+                                "type": "dashboard",
+                                "html": html_fragment,
+                                "ts": timestamp_now(),
+                            },
+                        )
+                        last_html = html_fragment
+                    next_send = now + 5
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/logout":
@@ -2420,14 +3463,21 @@ class Handler(BaseHTTPRequestHandler):
         if not self.is_authenticated():
             self.redirect_with_cookie("/login")
             return
+        if parsed.path == "/ws/status":
+            self.handle_status_socket(parsed)
+            return
         if parsed.path == "/api/status":
             data = command_status(self.wan_if, self.lan_if)
             self.respond(json.dumps(data, indent=2), content_type="application/json")
             return
-        message = parse_qs(parsed.query).get("msg", [""])[0]
+        query = parse_qs(parsed.query)
+        message = query.get("msg", [""])[0]
+        device_filter = query.get("devices", ["online"])[0]
+        device_sort = query.get("sort", ["ip"])[0]
+        sort_dir = query.get("dir", ["asc"])[0]
         try:
             data = command_status(self.wan_if, self.lan_if)
-            self.respond(render_page(data, message))
+            self.respond(render_page(data, message, device_filter=device_filter, device_sort=device_sort, sort_dir=sort_dir))
         except Exception as exc:
             self.respond(f"<pre>{html.escape(str(exc))}</pre>", status=500)
 
@@ -2456,27 +3506,41 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if self.path == "/setup":
-                lan_if = apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                lan_if = apply_router_stack(self.wan_if, self.lan_if, self.current_lan_cidr())
                 self.redirect(f"Router config applied on {lan_if}")
+                return
+            if self.path == "/lan/save":
+                data = self.form()
+                lan_cidr = normalize_lan_cidr(data.get("lan_cidr", ""))
+                state = load_state()
+                state["lan_cidr"] = lan_cidr
+                prune_lan_scoped_state(state, lan_cidr)
+                save_state(state)
+                self.lan_cidr = lan_cidr
+                Handler.lan_cidr = lan_cidr
+                lan_if = apply_router_stack(self.wan_if, self.lan_if, lan_cidr)
+                dhcp_start, dhcp_end, _ = dhcp_range_for(lan_cidr)
+                self.redirect(f"LAN CIDR saved on {lan_if}: {lan_cidr}; DHCP {dhcp_start} - {dhcp_end}")
                 return
             if self.path == "/stop":
                 state = load_state()
                 lan_if = active_lan_if(self.lan_if, state)
-                stop_router(self.wan_if, lan_if)
+                stop_router(self.wan_if, lan_if, self.lan_if)
                 if lan_if != self.lan_if:
-                    stop_router(self.wan_if, self.lan_if)
+                    for stale_if in interface_list(self.lan_if):
+                        stop_router(self.wan_if, stale_if, self.lan_if)
                 self.redirect("Router stopped")
                 return
             if self.path == "/mac/rotate":
                 target = self.form().get("target", "")
                 if target == "wan":
                     _, new_mac = rotate_interface_mac(self.wan_if)
-                    apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                    apply_router_stack(self.wan_if, self.lan_if, self.current_lan_cidr())
                     self.redirect(f"WAN MAC rotated: {new_mac}")
                     return
                 if target == "lan":
                     _, new_mac = rotate_interface_mac(self.current_lan_if())
-                    apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                    apply_router_stack(self.wan_if, self.lan_if, self.current_lan_cidr())
                     self.redirect(f"LAN MAC rotated: {new_mac}")
                     return
                 raise ValueError("MAC target khong hop le")
@@ -2491,9 +3555,9 @@ class Handler(BaseHTTPRequestHandler):
                 state["hotspot"] = new_hotspot
                 new_lan_if = active_lan_if(self.lan_if, state)
                 if old_lan_if != new_lan_if:
-                    stop_router(self.wan_if, old_lan_if)
+                    stop_router(self.wan_if, old_lan_if, self.lan_if)
                 save_state(state)
-                lan_if = apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                lan_if = apply_router_stack(self.wan_if, self.lan_if, self.current_lan_cidr())
                 self.redirect(f"WiFi hotspot started on {lan_if}")
                 return
             if self.path == "/hotspot/stop":
@@ -2505,8 +3569,8 @@ class Handler(BaseHTTPRequestHandler):
                 state["hotspot"] = hotspot
                 save_state(state)
                 if was_enabled:
-                    stop_router(self.wan_if, old_lan_if)
-                    lan_if = apply_router_stack(self.wan_if, self.lan_if, self.lan_cidr)
+                    stop_router(self.wan_if, old_lan_if, self.lan_if)
+                    lan_if = apply_router_stack(self.wan_if, self.lan_if, self.current_lan_cidr())
                     self.redirect(f"WiFi hotspot stopped; LAN output {lan_if}")
                     return
                 stop_hotspot(hotspot)
@@ -2581,6 +3645,82 @@ class Handler(BaseHTTPRequestHandler):
                 apply_proxy_rules(self.current_lan_if())
                 self.redirect("Assignment saved")
                 return
+            if self.path == "/device/name":
+                data = self.form()
+                mac = normalize_mac(data.get("mac", ""))
+                if not mac:
+                    raise ValueError("MAC khong hop le")
+                name = str(data.get("name", "")).strip()[:64]
+                state = load_state()
+                names = state.setdefault("device_names", {})
+                if name:
+                    names[mac] = name
+                else:
+                    names.pop(mac, None)
+                save_state(state)
+                self.redirect("Device name saved")
+                return
+            if self.path == "/device/edit":
+                data = self.form()
+                mac = normalize_mac(data.get("mac", ""))
+                if not mac:
+                    raise ValueError("MAC khong hop le")
+                lan_cidr = self.current_lan_cidr()
+                name = str(data.get("name", "")).strip()[:64]
+                dhcp_ip = normalize_dhcp_reservation_ip(data.get("ip_address", data.get("dhcp_ip", "")), lan_cidr)
+                state = load_state()
+                names = state.setdefault("device_names", {})
+                reservations = state.setdefault("dhcp_reservations", {})
+                reservation_key = next((key for key in reservations if normalize_mac(key) == mac), mac)
+                previous_dhcp_ip = reservations.get(reservation_key, "")
+                reservation_changed = previous_dhcp_ip != dhcp_ip
+                removed_lease_ips = []
+                if reservation_key != mac:
+                    reservations.pop(reservation_key, None)
+                if dhcp_ip:
+                    for other_mac, other_ip in reservations.items():
+                        if normalize_mac(other_mac) != mac and other_ip == dhcp_ip:
+                            raise ValueError(f"DHCP IP {dhcp_ip} da duoc gan cho {other_mac}")
+                    reservations[mac] = dhcp_ip
+                else:
+                    reservations.pop(mac, None)
+                if name:
+                    names[mac] = name
+                else:
+                    names.pop(mac, None)
+                if reservation_changed:
+                    removed_lease_ips = remove_dnsmasq_leases_for_mac(mac)
+                save_state(state)
+                lan_if = self.current_lan_if()
+                start_dnsmasq(lan_if, lan_cidr)
+                if reservation_changed:
+                    refresh_ips = [previous_dhcp_ip, dhcp_ip, *removed_lease_ips]
+                    self.redirect(refresh_dhcp_client(mac, lan_if, refresh_ips))
+                else:
+                    self.redirect("Device updated")
+                return
+            if self.path == "/assign/clear":
+                state = load_state()
+                state["assignments"] = {}
+                state["load_balance"] = {"enabled": False, "family": load_balance_config(state)["family"]}
+                save_state(state)
+                apply_proxy_rules(self.current_lan_if())
+                self.redirect("All devices set to Direct/NAT")
+                return
+            if self.path == "/devices/clear-offline":
+                data = command_status(self.wan_if, self.lan_if)
+                state = load_state()
+                hidden = state.setdefault("hidden_offline_devices", {})
+                now = timestamp_now()
+                count = 0
+                for row in data.get("leases", []):
+                    key = device_presence_key(row)
+                    if key and not row.get("online") and key not in hidden:
+                        hidden[key] = now
+                        count += 1
+                save_state(state)
+                self.redirect(f"Cleared {count} offline devices; new active devices will reappear automatically")
+                return
             self.respond("not found", status=404)
         except Exception as exc:
             self.respond(f"<pre>{html.escape(str(exc))}</pre>", status=500)
@@ -2593,7 +3733,7 @@ def main():
     parser = argparse.ArgumentParser(description="Quick Ubuntu LAN router dashboard")
     parser.add_argument("--wan", default=detect_wan())
     parser.add_argument("--lan", default="")
-    parser.add_argument("--lan-cidr", default=DEFAULT_LAN_CIDR)
+    parser.add_argument("--lan-cidr", default="")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--apply", action="store_true", help="apply router config before starting web")
@@ -2612,29 +3752,31 @@ def main():
         state = load_state()
         lan_if = active_lan_if(args.lan, state)
         stop_web_server()
-        stop_router(args.wan, lan_if)
+        stop_router(args.wan, lan_if, args.lan)
         if lan_if != args.lan:
-            stop_router(args.wan, args.lan)
+            for stale_if in interface_list(args.lan):
+                stop_router(args.wan, stale_if, args.lan)
         print(f"Stopped router services/rules for WAN={args.wan} LAN={lan_if}")
         return
     if args.replace:
         stop_web_server()
     state = load_state()
-    state["lan_cidr"] = args.lan_cidr
+    lan_cidr = normalize_lan_cidr(args.lan_cidr or state.get("lan_cidr", DEFAULT_LAN_CIDR))
+    state["lan_cidr"] = lan_cidr
     save_state(state)
     Handler.wan_if = args.wan
     Handler.lan_if = args.lan
-    Handler.lan_cidr = args.lan_cidr
+    Handler.lan_cidr = lan_cidr
     Handler.admin_user = args.admin_user
     Handler.admin_password = load_or_create_admin_password()
     Handler.session_token = load_or_create_session_token()
     if args.apply:
-        apply_router_stack(args.wan, args.lan, args.lan_cidr)
+        apply_router_stack(args.wan, args.lan, lan_cidr)
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     WEB_PID.write_text(str(os.getpid()))
     print(f"Router manager: http://127.0.0.1:{args.port}")
-    print(f"WAN={args.wan} LAN={args.lan} LAN_IP={args.lan_cidr}")
+    print(f"WAN={args.wan} LAN={args.lan} LAN_IP={lan_cidr}")
     print(f"Admin login: {Handler.admin_user} / {Handler.admin_password}")
     try:
         server.serve_forever()
