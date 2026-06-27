@@ -16,7 +16,13 @@ Install runtime tools if they are missing:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y dnsmasq-base redsocks iptables conntrack hostapd iw
+sudo apt-get install -y dnsmasq-base redsocks iptables conntrack hostapd iw nodejs npm
+```
+
+Install Node dependencies once:
+
+```bash
+npm install
 ```
 
 Run:
@@ -24,6 +30,8 @@ Run:
 ```bash
 ./run-router.sh
 ```
+
+The dashboard/runtime is now 100% NestJS/TypeScript. The run/stop scripts build `src/` into `dist/` before starting `node dist/main.js`.
 
 Set a custom admin password before running:
 

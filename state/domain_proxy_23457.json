@@ -1,0 +1,12 @@
+{
+  "listen_ip": "10.42.0.1",
+  "listen_port": 23457,
+  "proxy": {
+    "type": "http",
+    "host": "103.154.63.42",
+    "port": 49187,
+    "login": "user49187",
+    "password": "Vd4xEFU8in",
+    "ip_version": "6"
+  }
+}
